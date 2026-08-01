@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 using System.IO.Ports;
 using System.Text;
 using System.Windows;
@@ -18,10 +19,15 @@ namespace SerialPort
         private readonly SerialPortService _service = new SerialPortService();
         private readonly DispatcherTimer _timerPortCheck = new DispatcherTimer();
         private long _receivedBytesTotal;
+        private StreamWriter _saveFileWriter;   // 文件保存流（勾选“文件保存”时创建）
+        private string _saveFilePath;           // 当前保存文件的完整路径
 
         public MainWindow()
         {
             InitializeComponent();
+
+            // 文件保存：默认保存路径为“我的文档”
+            txtSavePath.Text = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 
             // 串口列表（初始填充不提示；运行期由定时器自动检测变化）
             RefreshPortList(false);
@@ -74,8 +80,9 @@ namespace SerialPort
 
             Closed += (s, e) =>
             {
-                _timerPortCheck.Stop();   // 停止端口轮询
-                _service.Dispose();       // 关闭串口并释放资源（Dispose 幂等）
+                _timerPortCheck.Stop();       // 停止端口轮询
+                _saveFileWriter?.Dispose();   // 关闭保存文件
+                _service.Dispose();           // 关闭串口并释放资源（Dispose 幂等）
             };
 
             UpdateStatus("就绪");
@@ -167,6 +174,7 @@ namespace SerialPort
             btnToggleConnect.Background = connected
                 ? (Brush)FindResource("PortCloseBrush")
                 : (Brush)FindResource("PortOpenBrush");
+            UpdateFileEditState(connected);   // 串口打开时禁止修改文件名
             if (!connected) UpdateStatus("已断开");
         }
 
@@ -188,8 +196,14 @@ namespace SerialPort
 
             _receivedBytesTotal += e.Data.Length;
 
+            string increment = GetIncrementText(e.Data);
+
             // 增量追加（WPF 下全量重赋 Text 会重建整个文本，大数据量时卡顿）
-            txtReceive.AppendText(GetIncrementText(e.Data));
+            txtReceive.AppendText(increment);
+
+            // 勾选“文件保存”时把同样的内容写入文件
+            if (_saveFileWriter != null)
+                _saveFileWriter.Write(increment);
 
             if (chkAutoScroll.IsChecked == true)
                 txtReceive.ScrollToEnd();
@@ -252,6 +266,127 @@ namespace SerialPort
             _receivedBytesTotal = 0;
             txtReceive.Clear();
             UpdateStatus("已清空接收区");
+        }
+
+        // ============================================================
+        // 文件保存（勾选后生成 yyyy-MM-dd_HH-mm-ss.txt，随接收数据追加写入）
+        // ============================================================
+        private void ChkSaveFile_Changed(object sender, RoutedEventArgs e)
+        {
+            if (chkSaveFile.IsChecked == true)
+            {
+                StartSaveFile();
+                return;
+            }
+            // 取消勾选：关闭当前保存文件
+            if (_saveFileWriter != null)
+            {
+                _saveFileWriter.Dispose();
+                _saveFileWriter = null;
+            }
+            txtSaveFileName.Text = string.Empty;
+            UpdateFileEditState(_service.IsOpen);
+        }
+
+        /// <summary>在保存路径下以默认文件名（年月日时分秒）新建文件；路径为空时回退到“我的文档”。</summary>
+        private void StartSaveFile()
+        {
+            string dir = txtSavePath.Text.Trim();
+            if (string.IsNullOrEmpty(dir))
+            {
+                dir = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+                txtSavePath.Text = dir;
+            }
+            string name = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".txt";
+            try
+            {
+                _saveFileWriter = new StreamWriter(Path.Combine(dir, name), true, new UTF8Encoding(false))
+                {
+                    AutoFlush = true
+                };
+                _saveFilePath = Path.Combine(dir, name);
+                txtSaveFileName.Text = name;
+                UpdateStatus($"开始保存到 {_saveFilePath}");
+            }
+            catch (Exception ex)
+            {
+                _saveFileWriter = null;
+                chkSaveFile.IsChecked = false;   // 创建失败则取消勾选，保持状态一致
+                MessageBox.Show($"创建保存文件失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            UpdateFileEditState(_service.IsOpen);
+        }
+
+        /// <summary>浏览按钮：弹出文件夹选择窗口，选择文件保存路径。</summary>
+        private void BtnBrowsePath_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new System.Windows.Forms.FolderBrowserDialog
+            {
+                Description = "选择文件保存路径",
+                SelectedPath = txtSavePath.Text.Trim()
+            };
+            if (dlg.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
+
+            txtSavePath.Text = dlg.SelectedPath;
+            // 保存已开启时路径变更：关闭旧文件，以新路径重新生成默认文件名文件
+            if (chkSaveFile.IsChecked == true && _saveFileWriter != null)
+            {
+                _saveFileWriter.Dispose();
+                _saveFileWriter = null;
+                StartSaveFile();
+            }
+        }
+
+        /// <summary>修改文件名（仅串口关闭时可用）：重命名磁盘上的当前保存文件。</summary>
+        private void BtnModifyFileName_Click(object sender, RoutedEventArgs e)
+        {
+            if (_service.IsOpen)
+            {
+                MessageBox.Show("串口已连接，无法修改文件名。请先关闭串口。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (_saveFileWriter == null) return;   // 未勾选文件保存，无文件可改名
+
+            string name = txtSaveFileName.Text.Trim();
+            if (string.IsNullOrEmpty(name))
+            {
+                MessageBox.Show("文件名不能为空。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            {
+                MessageBox.Show("文件名包含非法字符。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (!name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
+                name += ".txt";
+
+            string newPath = Path.Combine(Path.GetDirectoryName(_saveFilePath), name);
+            if (string.Equals(newPath, _saveFilePath, StringComparison.OrdinalIgnoreCase)) return;   // 名字未变
+            if (File.Exists(newPath))
+            {
+                MessageBox.Show($"同名文件已存在：{name}", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            try
+            {
+                File.Move(_saveFilePath, newPath);
+                _saveFilePath = newPath;
+                txtSaveFileName.Text = name;
+                UpdateStatus($"保存文件已重命名为 {name}");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"重命名失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        /// <summary>文件名编辑状态：未勾选文件保存或串口已打开时均禁止修改文件名。</summary>
+        private void UpdateFileEditState(bool connected)
+        {
+            bool saveChecked = chkSaveFile.IsChecked == true;
+            txtSaveFileName.IsReadOnly = !saveChecked || connected;
+            btnModifyFileName.IsEnabled = saveChecked && !connected;
         }
 
         // ============================================================

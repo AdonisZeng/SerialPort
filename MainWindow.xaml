@@ -9,28 +9,31 @@
         Background="{DynamicResource PanelBackBrush}">
     <Grid>
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />   <!-- 行0 顶栏 -->
-            <RowDefinition Height="*" />      <!-- 行1 接收区 -->
-            <RowDefinition Height="Auto" />   <!-- 行2 分隔条 -->
-            <RowDefinition Height="Auto" />   <!-- 行3 配置 + 发送区 -->
-            <RowDefinition Height="Auto" />   <!-- 行4 状态栏 -->
+            <RowDefinition Height="Auto" />
+            <!-- 行0 顶栏 -->
+            <RowDefinition Height="*" />
+            <!-- 行1 接收区 -->
+            <RowDefinition Height="Auto" />
+            <!-- 行2 分隔条 -->
+            <RowDefinition Height="Auto" />
+            <!-- 行3 配置 + 发送区 -->
+            <RowDefinition Height="Auto" />
+            <!-- 行4 状态栏 -->
         </Grid.RowDefinitions>
 
         <!-- 顶栏：主题切换按钮 -->
-        <Grid Grid.Row="0" Height="44" Background="{DynamicResource TopBarBackBrush}">
-            <Button x:Name="btnThemeToggle" Content="深色模式" Click="BtnThemeToggle_Click"
-                    Style="{StaticResource SecondaryButtonStyle}"
-                    Width="100" Height="28"
-                    HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0" />
-        </Grid>
 
         <!-- 接收区：只读文本 + 悬浮清空按钮 -->
         <Grid Grid.Row="1" Background="{DynamicResource PanelBackBrush}">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="20*"/>
+                <RowDefinition Height="103*"/>
+            </Grid.RowDefinitions>
             <TextBox x:Name="txtReceive" IsReadOnly="True" TextWrapping="Wrap"
                      VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
                      FontFamily="Consolas" FontSize="10pt"
                      Padding="6,6,78,6"
-                     SelectionBrush="#80466EC8" />
+                     SelectionBrush="#80466EC8" Margin="10,8,85,10" Grid.RowSpan="2" />
             <Button x:Name="btnClearReceive" Content="清空" Click="BtnClearReceive_Click"
                     Style="{StaticResource SecondaryButtonStyle}"
                     Width="70" Height="26"
@@ -45,9 +48,12 @@
         <!-- 配置 + 发送区 -->
         <Grid Grid.Row="3" Background="{DynamicResource HeaderBackBrush}" MinHeight="228">
             <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />   <!-- 配置区 -->
-                <RowDefinition Height="Auto" />   <!-- 发送框 -->
-                <RowDefinition Height="Auto" />   <!-- 按钮栏 -->
+                <RowDefinition Height="Auto" />
+                <!-- 配置区 -->
+                <RowDefinition Height="Auto" />
+                <!-- 发送框 -->
+                <RowDefinition Height="Auto" />
+                <!-- 按钮栏 -->
             </Grid.RowDefinitions>
 
             <!-- 配置区：两行三列下拉 + 复选行 -->
@@ -94,27 +100,55 @@
                               VerticalContentAlignment="Center" />
                 </StackPanel>
                 <StackPanel Grid.Row="1" Grid.Column="2" Orientation="Horizontal" Margin="0,0,0,8">
-                    <Label Content="流控" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <Label Content="流　控" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <ComboBox x:Name="cboHandshake" Width="102" Height="26" IsEditable="False"
                               VerticalContentAlignment="Center" />
                 </StackPanel>
 
-                <!-- 行2：复选项 -->
-                <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
+                <!-- 行2：打开串口按钮 + 复选项 -->
+                <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="4" Orientation="Horizontal">
+                    <Button x:Name="btnToggleConnect" Content="打开串口" Click="BtnToggleConnect_Click"
+                            Style="{StaticResource AccentButtonStyle}"
+                            Background="{StaticResource PortOpenBrush}"
+                            Width="88" Height="36" Margin="0,0,18,0" VerticalAlignment="Center" />
                     <CheckBox x:Name="chkSendHex" Content="16进制发送" Margin="0,0,18,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkReceiveHex" Content="16进制显示" Margin="0,0,18,0" VerticalAlignment="Center" />
                     <CheckBox x:Name="chkSendNewLine" Content="追加换行符" IsChecked="True"
                               Margin="0,0,18,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkReceiveHex" Content="16进制显示" Margin="0,0,18,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkAutoScroll" Content="自动滚动" IsChecked="True" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkAutoScroll" Content="自动滚动" IsChecked="True" Margin="0,0,18,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkSaveFile" Content="文件保存" VerticalAlignment="Center"
+                              Checked="ChkSaveFile_Changed" Unchecked="ChkSaveFile_Changed" />
                 </StackPanel>
 
-                <!-- 列3：打开 / 关闭串口（强调色，绿色 = 已关闭，红色 = 已连接） -->
-                <Button x:Name="btnToggleConnect" Content="打开串口" Click="BtnToggleConnect_Click"
-                        Style="{StaticResource AccentButtonStyle}"
-                        Background="{StaticResource PortOpenBrush}"
-                        Width="88" Height="36"
-                        Grid.Row="0" Grid.Column="3" Grid.RowSpan="3"
-                        HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0" />
+                <!-- 列3：文件保存区（路径选择 + 文件名修改） -->
+                <Grid Grid.Row="0" Grid.Column="3" Grid.RowSpan="2"
+                      Margin="18,0,0,0" VerticalAlignment="Center">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <!-- 标签列（两行标签共用，天然左对齐） -->
+                        <ColumnDefinition Width="*" />
+                        <!-- 输入框列 -->
+                        <ColumnDefinition Width="Auto" />
+                        <!-- 按钮列 -->
+                    </Grid.ColumnDefinitions>
+                    <!-- 行0：保存路径 + 浏览按钮 -->
+                    <Label Grid.Row="0" Content="文件保存路径" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBox x:Name="txtSavePath" Grid.Row="0" Grid.Column="1" Height="26" IsReadOnly="True"
+                             VerticalContentAlignment="Center" />
+                    <Button x:Name="btnBrowsePath" Grid.Row="0" Grid.Column="2" Content="…" Width="34" Height="26"
+                            Margin="6,0,0,0" Style="{StaticResource SecondaryButtonStyle}" Click="BtnBrowsePath_Click" />
+                    <!-- 行1：文件名 + 修改按钮（串口打开时禁止修改） -->
+                    <Label Grid.Row="1" Content="        文 件 名" Padding="0" VerticalAlignment="Center" Margin="0,8,6,0" />
+                    <TextBox x:Name="txtSaveFileName" Grid.Row="1" Grid.Column="1" Height="26" IsReadOnly="True"
+                             VerticalContentAlignment="Center" Margin="0,8,0,0" />
+                    <Button x:Name="btnModifyFileName" Grid.Row="1" Grid.Column="2" Content="修改" Width="40" Height="26"
+                            Margin="6,8,0,0" Style="{StaticResource SecondaryButtonStyle}" Click="BtnModifyFileName_Click" />
+                </Grid>
+
             </Grid>
 
             <!-- 发送框 -->
@@ -124,15 +158,19 @@
 
             <!-- 按钮栏 -->
             <StackPanel Grid.Row="2" Orientation="Horizontal" Height="32"
-                        HorizontalAlignment="Right" Margin="0,0,10,8">
-                <Button x:Name="btnClearSend" Content="清空" Click="BtnClearSend_Click"
-                        Style="{StaticResource SecondaryButtonStyle}"
-                        Width="70" Height="26" Margin="0,0,8,0" />
-                <Button x:Name="btnSend" Content="▶ 发送" Click="BtnSend_Click"
+                        HorizontalAlignment="Left" Margin="12,0,0,8">
+                <Button x:Name="btnSend" Content="发送" Click="BtnSend_Click"
                         Style="{StaticResource AccentButtonStyle}"
                         Background="{StaticResource SendBtnBrush}"
-                        Width="90" Height="28" />
+                        Width="90" Height="28" Margin="0,0,8,0" />
+                <Button x:Name="btnClearSend" Content="清空" Click="BtnClearSend_Click"
+                        Style="{StaticResource SecondaryButtonStyle}"
+                        Width="70" Height="26" />
             </StackPanel>
+            <Button x:Name="btnThemeToggle" Content="深色模式" Click="BtnThemeToggle_Click"
+                    Style="{StaticResource SecondaryButtonStyle}"
+                    Width="100" Height="28"
+                    HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,0,12,0" Grid.Row="2" />
         </Grid>
 
         <!-- 状态栏 -->
