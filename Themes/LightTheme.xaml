@@ -1,0 +1,15 @@
+﻿<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- 浅色主题调色板（与源 WinForms 版 ThemeManager.LightPalette 色值一致） -->
+    <SolidColorBrush x:Key="TopBarBackBrush" Color="#E1E4EC" />
+    <SolidColorBrush x:Key="PanelBackBrush" Color="#F5F6FA" />
+    <SolidColorBrush x:Key="HeaderBackBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="InputBackBrush" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="InputForeBrush" Color="#1E212C" />
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="#3C4150" />
+    <SolidColorBrush x:Key="StatusTextBrush" Color="#3C4150" />
+    <SolidColorBrush x:Key="SeparatorBrush" Color="#BEC3CD" />
+    <SolidColorBrush x:Key="SecondaryBtnBackBrush" Color="#FAFBFE" />
+    <SolidColorBrush x:Key="SecondaryBtnForeBrush" Color="#1E212C" />
+    <SolidColorBrush x:Key="SecondaryBtnBorderBrush" Color="#A0A5B4" />
+</ResourceDictionary>

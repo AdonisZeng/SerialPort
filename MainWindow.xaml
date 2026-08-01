@@ -1,0 +1,145 @@
+﻿<Window x:Class="SerialPort.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="SerialPort  串口调试工具"
+        Width="1000" Height="660"
+        MinWidth="860" MinHeight="560"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Segoe UI" FontSize="12"
+        Background="{DynamicResource PanelBackBrush}">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />   <!-- 行0 顶栏 -->
+            <RowDefinition Height="*" />      <!-- 行1 接收区 -->
+            <RowDefinition Height="Auto" />   <!-- 行2 分隔条 -->
+            <RowDefinition Height="Auto" />   <!-- 行3 配置 + 发送区 -->
+            <RowDefinition Height="Auto" />   <!-- 行4 状态栏 -->
+        </Grid.RowDefinitions>
+
+        <!-- 顶栏：主题切换按钮 -->
+        <Grid Grid.Row="0" Height="44" Background="{DynamicResource TopBarBackBrush}">
+            <Button x:Name="btnThemeToggle" Content="深色模式" Click="BtnThemeToggle_Click"
+                    Style="{StaticResource SecondaryButtonStyle}"
+                    Width="100" Height="28"
+                    HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0" />
+        </Grid>
+
+        <!-- 接收区：只读文本 + 悬浮清空按钮 -->
+        <Grid Grid.Row="1" Background="{DynamicResource PanelBackBrush}">
+            <TextBox x:Name="txtReceive" IsReadOnly="True" TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                     FontFamily="Consolas" FontSize="10pt"
+                     Padding="6,6,78,6"
+                     SelectionBrush="#80466EC8" />
+            <Button x:Name="btnClearReceive" Content="清空" Click="BtnClearReceive_Click"
+                    Style="{StaticResource SecondaryButtonStyle}"
+                    Width="70" Height="26"
+                    HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,8,10,0" />
+        </Grid>
+
+        <!-- 分隔条：可拖动调整接收区与配置区高度 -->
+        <GridSplitter Grid.Row="2" Height="2" HorizontalAlignment="Stretch"
+                      Background="{DynamicResource SeparatorBrush}"
+                      ResizeBehavior="PreviousAndNext" />
+
+        <!-- 配置 + 发送区 -->
+        <Grid Grid.Row="3" Background="{DynamicResource HeaderBackBrush}" MinHeight="228">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />   <!-- 配置区 -->
+                <RowDefinition Height="Auto" />   <!-- 发送框 -->
+                <RowDefinition Height="Auto" />   <!-- 按钮栏 -->
+            </Grid.RowDefinitions>
+
+            <!-- 配置区：两行三列下拉 + 复选行 -->
+            <Grid Grid.Row="0" Margin="12,8,12,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="170" />
+                    <ColumnDefinition Width="170" />
+                    <ColumnDefinition Width="170" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- 行0：端口号 / 波特率 / 数据位 -->
+                <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" Margin="0,0,0,8">
+                    <Label Content="端口号" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="cboPortName" Width="102" Height="26" IsEditable="False"
+                              VerticalContentAlignment="Center"
+                              DropDownOpened="cboPortName_DropDown" />
+                </StackPanel>
+                <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
+                    <Label Content="波特率" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="cboBaudRate" Width="102" Height="26" IsEditable="False"
+                              VerticalContentAlignment="Center" />
+                </StackPanel>
+                <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal" Margin="0,0,0,8">
+                    <Label Content="数据位" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="cboDataBits" Width="102" Height="26" IsEditable="False"
+                              VerticalContentAlignment="Center" />
+                </StackPanel>
+
+                <!-- 行1：停止位 / 校验位 / 流控 -->
+                <StackPanel Grid.Row="1" Grid.Column="0" Orientation="Horizontal" Margin="0,0,0,8">
+                    <Label Content="停止位" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="cboStopBits" Width="102" Height="26" IsEditable="False"
+                              VerticalContentAlignment="Center" />
+                </StackPanel>
+                <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
+                    <Label Content="校验位" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="cboParity" Width="102" Height="26" IsEditable="False"
+                              VerticalContentAlignment="Center" />
+                </StackPanel>
+                <StackPanel Grid.Row="1" Grid.Column="2" Orientation="Horizontal" Margin="0,0,0,8">
+                    <Label Content="流控" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="cboHandshake" Width="102" Height="26" IsEditable="False"
+                              VerticalContentAlignment="Center" />
+                </StackPanel>
+
+                <!-- 行2：复选项 -->
+                <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
+                    <CheckBox x:Name="chkSendHex" Content="16进制发送" Margin="0,0,18,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkSendNewLine" Content="追加换行符" IsChecked="True"
+                              Margin="0,0,18,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkReceiveHex" Content="16进制显示" Margin="0,0,18,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkAutoScroll" Content="自动滚动" IsChecked="True" VerticalAlignment="Center" />
+                </StackPanel>
+
+                <!-- 列3：打开 / 关闭串口（强调色，绿色 = 已关闭，红色 = 已连接） -->
+                <Button x:Name="btnToggleConnect" Content="打开串口" Click="BtnToggleConnect_Click"
+                        Style="{StaticResource AccentButtonStyle}"
+                        Background="{StaticResource PortOpenBrush}"
+                        Width="88" Height="36"
+                        Grid.Row="0" Grid.Column="3" Grid.RowSpan="3"
+                        HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0" />
+            </Grid>
+
+            <!-- 发送框 -->
+            <TextBox x:Name="txtSend" Grid.Row="1" Height="84" Margin="12,0,12,8"
+                     TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                     FontFamily="Consolas" FontSize="10pt" />
+
+            <!-- 按钮栏 -->
+            <StackPanel Grid.Row="2" Orientation="Horizontal" Height="32"
+                        HorizontalAlignment="Right" Margin="0,0,10,8">
+                <Button x:Name="btnClearSend" Content="清空" Click="BtnClearSend_Click"
+                        Style="{StaticResource SecondaryButtonStyle}"
+                        Width="70" Height="26" Margin="0,0,8,0" />
+                <Button x:Name="btnSend" Content="▶ 发送" Click="BtnSend_Click"
+                        Style="{StaticResource AccentButtonStyle}"
+                        Background="{StaticResource SendBtnBrush}"
+                        Width="90" Height="28" />
+            </StackPanel>
+        </Grid>
+
+        <!-- 状态栏 -->
+        <Border Grid.Row="4" Height="22" Background="{DynamicResource TopBarBackBrush}">
+            <TextBlock x:Name="txtStatus" Text="  就绪" Margin="12,0,0,0"
+                       VerticalAlignment="Center"
+                       Foreground="{DynamicResource StatusTextBrush}" />
+        </Border>
+    </Grid>
+</Window>
