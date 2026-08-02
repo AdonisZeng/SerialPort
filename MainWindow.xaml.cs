@@ -628,6 +628,7 @@ namespace SerialPort
             else if (_manualCheck)
             {
                 _manualCheck = false;
+                UpdateStatus($"已是最新版本 v{result.CurrentVersion}");
                 MessageBox.Show($"当前已是最新版本（v{result.CurrentVersion}）。", "检查更新",
                     MessageBoxButton.OK, MessageBoxImage.Information);
             }
