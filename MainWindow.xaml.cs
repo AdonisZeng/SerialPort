@@ -22,6 +22,15 @@ namespace SerialPort
         private StreamWriter _saveFileWriter;   // 文件保存流（勾选“文件保存”时创建）
         private string _saveFilePath;           // 当前保存文件的完整路径
 
+        // 搜索状态（接收区查找）
+        private string _searchTerm;
+        private bool _searchMatchCase;
+        private bool _searchWholeWord;
+        private int _searchIndex = -1;          // 最近一次匹配的起始下标；-1 = 无
+
+        // 筛选状态（_filterState 非空表示筛选已启用）
+        private FilterState _filterState;
+
         public MainWindow()
         {
             InitializeComponent();
@@ -198,8 +207,17 @@ namespace SerialPort
 
             string increment = GetIncrementText(e.Data);
 
-            // 增量追加（WPF 下全量重赋 Text 会重建整个文本，大数据量时卡顿）
-            txtReceive.AppendText(increment);
+            if (_filterState != null)
+            {
+                // 筛选启用：完整文本记入缓冲，接收区只追加符合筛选条件的行
+                _filterState.Buffer.Append(increment);
+                AppendFiltered(increment);
+            }
+            else
+            {
+                // 增量追加（WPF 下全量重赋 Text 会重建整个文本，大数据量时卡顿）
+                txtReceive.AppendText(increment);
+            }
 
             // 勾选“文件保存”时把同样的内容写入文件
             if (_saveFileWriter != null)
@@ -264,8 +282,200 @@ namespace SerialPort
         private void BtnClearReceive_Click(object sender, RoutedEventArgs e)
         {
             _receivedBytesTotal = 0;
+            // 同时复位搜索 / 筛选状态，保证清空后显示一致
+            _searchIndex = -1;
+            _filterState = null;
             txtReceive.Clear();
             UpdateStatus("已清空接收区");
+        }
+
+        // ============================================================
+        // 搜索 / 筛选（接收区左下角悬浮按钮）
+        // ============================================================
+        private void BtnSearchReceive_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new SearchFilterWindow(this, false);
+            dlg.ShowDialog();   // 模态打开；期间接收数据仍在追加，查找始终基于当前接收区内容
+        }
+
+        private void BtnFilterReceive_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new SearchFilterWindow(this, true);
+            dlg.ShowDialog();
+        }
+
+        /// <summary>在接收区中查找匹配项并高亮显示；找到返回 true。backward = true 时向上查找（否则向下），找不到则环绕。</summary>
+        internal bool Find(string term, bool matchCase, bool wholeWord, bool backward)
+        {
+            string text = txtReceive.Text;
+            if (string.IsNullOrEmpty(term) || text.Length == 0) return false;
+            UpdateSearchState(term, matchCase, wholeWord);
+
+            int idx;
+            if (backward)
+            {
+                int limit = _searchIndex < 0 ? text.Length : _searchIndex;
+                idx = FindMatchIndexBackward(text, term, limit, matchCase, wholeWord);
+                if (idx < 0 && limit > 0)
+                    idx = FindMatchIndexBackward(text, term, text.Length, matchCase, wholeWord);   // 环绕
+            }
+            else
+            {
+                int from = _searchIndex < 0 ? 0 : _searchIndex + term.Length;
+                idx = FindMatchIndex(text, term, from, matchCase, wholeWord);
+                if (idx < 0 && from > 0) idx = FindMatchIndex(text, term, 0, matchCase, wholeWord);   // 环绕
+            }
+            if (idx < 0) return false;
+
+            HighlightMatch(idx, term.Length);
+            _searchIndex = idx;
+            return true;
+        }
+
+        /// <summary>搜索词或匹配选项变化时重置查找位置（接收区清空时由 BtnClearReceive_Click 复位）。</summary>
+        private void UpdateSearchState(string term, bool matchCase, bool wholeWord)
+        {
+            if (_searchTerm != term || _searchMatchCase != matchCase || _searchWholeWord != wholeWord)
+                _searchIndex = -1;
+            _searchTerm = term;
+            _searchMatchCase = matchCase;
+            _searchWholeWord = wholeWord;
+        }
+
+        /// <summary>选中并滚动到匹配项（接收框只读，选中即高亮显示）。</summary>
+        private void HighlightMatch(int index, int length)
+        {
+            txtReceive.Select(index, length);
+            txtReceive.ScrollToLine(txtReceive.GetLineIndexFromCharacterIndex(index));
+        }
+
+        /// <summary>应用筛选：接收区仅显示包含筛选内容的行，新数据只追加匹配行。</summary>
+        internal void ApplyFilter(string term, bool matchCase, bool wholeWord)
+        {
+            if (string.IsNullOrEmpty(term))
+            {
+                ClearFilter();
+                return;
+            }
+            if (_filterState == null)
+            {
+                // 首次启用：以当前接收区内容作为全量文本（此后新数据同时记入缓冲）
+                _filterState = new FilterState();
+                _filterState.Buffer.Append(txtReceive.Text);
+            }
+            _filterState.Term = term;
+            _filterState.MatchCase = matchCase;
+            _filterState.WholeWord = wholeWord;
+            RebuildFilteredView();
+            UpdateStatus($"筛选已启用：{term}");
+        }
+
+        /// <summary>清除筛选：恢复显示完整接收内容。</summary>
+        internal void ClearFilter()
+        {
+            if (_filterState == null) return;
+            txtReceive.Text = _filterState.Buffer.ToString();
+            _filterState = null;
+            if (chkAutoScroll.IsChecked == true) txtReceive.ScrollToEnd();
+            UpdateStatus("已清除筛选");
+        }
+
+        /// <summary>按当前筛选条件重建接收区显示内容。</summary>
+        private void RebuildFilteredView()
+        {
+            txtReceive.Clear();
+            if (_filterState == null) return;
+            foreach (string line in SplitLines(_filterState.Buffer.ToString()))
+                AppendLineIfMatches(line);
+            if (chkAutoScroll.IsChecked == true) txtReceive.ScrollToEnd();
+        }
+
+        /// <summary>筛选启用期间追加新数据：只显示包含筛选内容的行，未结束的行暂存待续。</summary>
+        private void AppendFiltered(string increment)
+        {
+            // 不变量：PendingLine 中不含换行；仅当本块含换行时才整行拆分处理
+            if (increment.IndexOfAny(NewLineChars) < 0)
+            {
+                _filterState.PendingLine.Append(increment);
+                return;
+            }
+            _filterState.PendingLine.Append(increment);
+            string[] lines = SplitLines(_filterState.PendingLine.ToString());
+            _filterState.PendingLine.Clear();
+            _filterState.PendingLine.Append(lines[lines.Length - 1]);   // 末段可能是不完整的一行，继续暂存
+            for (int i = 0; i < lines.Length - 1; i++)
+                AppendLineIfMatches(lines[i]);
+        }
+
+        /// <summary>整行包含筛选内容时追加显示（含行尾换行）。</summary>
+        private void AppendLineIfMatches(string line)
+        {
+            if (FindMatchIndex(line, _filterState.Term, 0, _filterState.MatchCase, _filterState.WholeWord) >= 0)
+            {
+                txtReceive.AppendText(line);
+                txtReceive.AppendText("\r\n");
+            }
+        }
+
+        /// <summary>换行符检测（与 SplitLines 支持的范围一致）。</summary>
+        private static readonly char[] NewLineChars = { '\r', '\n' };
+
+        /// <summary>按行拆分（兼容 \r\n、\r、\n 三种换行）。</summary>
+        private static string[] SplitLines(string text) =>
+            text.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+
+        /// <summary>在 text 中从 startIndex 起正向查找 term，返回匹配起始下标；未找到返回 -1。</summary>
+        private static int FindMatchIndex(string text, string term, int startIndex, bool matchCase, bool wholeWord)
+        {
+            if (startIndex < 0 || startIndex >= text.Length) return -1;
+            StringComparison cmp = matchCase ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            int idx = text.IndexOf(term, startIndex, cmp);
+            while (idx >= 0)
+            {
+                if (!wholeWord || IsWholeWordAt(text, idx, term.Length)) return idx;
+                idx = text.IndexOf(term, idx + 1, cmp);
+            }
+            return -1;
+        }
+
+        /// <summary>查找起点小于 limit 的最后一个匹配；未找到返回 -1。
+        /// 利用 LastIndexOf 的语义（匹配整体落在 [0, startIndex] 内）：
+        /// 起点 &lt; limit 等价于终点 &lt;= limit - 1，故 startIndex = limit + term.Length - 2。</summary>
+        private static int FindMatchIndexBackward(string text, string term, int limit, bool matchCase, bool wholeWord)
+        {
+            if (limit <= 0) return -1;
+            StringComparison cmp = matchCase ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
+            int startIndex = Math.Min(limit, text.Length) + term.Length - 2;
+            if (startIndex > text.Length - 1) startIndex = text.Length - 1;
+            int idx = text.LastIndexOf(term, startIndex, cmp);
+            while (idx >= 0)
+            {
+                if (!wholeWord || IsWholeWordAt(text, idx, term.Length)) return idx;
+                if (idx == 0) break;
+                idx = text.LastIndexOf(term, idx + term.Length - 2, cmp);   // 向前找下一个起点更小的匹配
+            }
+            return -1;
+        }
+
+        /// <summary>判断 [index, index+length) 是否为全词匹配（两侧都不是单词字符，中文按一个词处理）。</summary>
+        private static bool IsWholeWordAt(string text, int index, int length)
+        {
+            bool leftOk = index == 0 || !IsWordChar(text[index - 1]);
+            bool rightOk = index + length >= text.Length || !IsWordChar(text[index + length]);
+            return leftOk && rightOk;
+        }
+
+        /// <summary>单词字符：字母（含中文）、数字、下划线。</summary>
+        private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+        /// <summary>筛选状态：启用筛选时保存完整接收文本与筛选条件；禁用时 _filterState 为 null。</summary>
+        private sealed class FilterState
+        {
+            public readonly StringBuilder Buffer = new StringBuilder();        // 完整接收文本
+            public readonly StringBuilder PendingLine = new StringBuilder();   // 未以换行结束的行片段（不含换行）
+            public string Term;
+            public bool MatchCase;
+            public bool WholeWord;
         }
 
         // ============================================================
