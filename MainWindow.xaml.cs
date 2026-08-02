@@ -35,7 +35,6 @@ namespace SerialPort
 
         // 时间戳显示状态（状态机始终运行，与复选框勾选状态无关）
         private bool _atLineStart = true;   // 当前处于行首（下一个非换行字符应补时间戳）
-        private bool _lastWasCr;            // 上一字符是 \r（用于区分 \r\n 与单独 \r，含跨块拆分）
 
         public MainWindow()
         {
@@ -262,29 +261,27 @@ namespace SerialPort
         /// </summary>
         private string GetTimestampedText(string increment)
         {
+            // 未勾选时无需构造输出：只跟踪行首位置（复用 NewLineChars 快速扫描），直接返回原文
+            if (chkTimestamp.IsChecked != true)
+            {
+                if (increment.IndexOfAny(NewLineChars) >= 0) _atLineStart = true;
+                return increment;
+            }
+
             StringBuilder sb = new StringBuilder(increment.Length + 12);
-            bool emitTimestamp = chkTimestamp.IsChecked == true;
             bool atLineStart = _atLineStart;
-            bool lastWasCr = _lastWasCr;
+            DateTime now = DateTime.Now;   // 同一数据块的所有行共享同一时刻（秒级精度下无差别）
             foreach (char c in increment)
             {
-                // 先判定上个字符：单独 \r 在此字符处终结上一行（须先于补戳检查，\r 后首个字符才能正确加戳）
-                if (lastWasCr)
+                if (atLineStart && !IsNewLineChar(c))
                 {
-                    if (c != '\n') atLineStart = true;
-                    lastWasCr = false;
-                }
-                if (atLineStart && emitTimestamp && c != '\r' && c != '\n')
-                {
-                    sb.Append('[').Append(DateTime.Now.ToString("HH:mm:ss")).Append("] ");
+                    sb.Append('[').Append(now.ToString("HH:mm:ss")).Append("] ");
                     atLineStart = false;
                 }
                 sb.Append(c);
-                if (c == '\r') lastWasCr = true;         // 等待可能的 \n
-                else if (c == '\n') atLineStart = true;  // \n（或 \r\n 的 \n）终结一行
+                if (IsNewLineChar(c)) atLineStart = true;   // \n / \r（含 \r\n 与单独 \r）终结一行
             }
             _atLineStart = atLineStart;
-            _lastWasCr = lastWasCr;
             return sb.ToString();
         }
 
@@ -464,6 +461,9 @@ namespace SerialPort
 
         /// <summary>换行符检测（与 SplitLines 支持的范围一致）。</summary>
         private static readonly char[] NewLineChars = { '\r', '\n' };
+
+        /// <summary>判断字符是否为换行符（与 <see cref="NewLineChars"/> 一致）。</summary>
+        private static bool IsNewLineChar(char c) => c == '\r' || c == '\n';
 
         /// <summary>按行拆分（兼容 \r\n、\r、\n 三种换行）。</summary>
         private static string[] SplitLines(string text) =>
@@ -662,16 +662,16 @@ namespace SerialPort
                 var dlg = new UpdateDialog(_updateService, result);
                 dlg.ShowDialog();
             }
-            else if (_manualCheck)
-            {
-                _manualCheck = false;
-                UpdateStatus($"已是最新版本 v{result.CurrentVersion}");
-                MessageBox.Show($"当前已是最新版本（v{result.CurrentVersion}）。", "检查更新",
-                    MessageBoxButton.OK, MessageBoxImage.Information);
-            }
             else
             {
+                // 已是最新：无论手动/自动都统一更新状态栏，手动检查才弹窗提示
                 UpdateStatus($"已是最新版本 v{result.CurrentVersion}");
+                if (_manualCheck)
+                {
+                    _manualCheck = false;
+                    MessageBox.Show($"当前已是最新版本（v{result.CurrentVersion}）。", "检查更新",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                }
             }
         }
 
