@@ -55,6 +55,10 @@ namespace SerialPort.Services
         /// <summary>获取系统中所有可用串口名称。</summary>
         public static string[] GetAvailablePorts() => SerialPortType.GetPortNames();
 
+        /// <summary>已连接端口是否仍存在于给定端口集合中（设备拔出检测）。</summary>
+        public bool IsOpenPortPresent(string[] availablePorts) =>
+            !IsOpen || Array.IndexOf(availablePorts, PortName) >= 0;
+
         /// <summary>
         /// 按指定参数打开串口。
         /// </summary>
@@ -96,14 +100,32 @@ namespace SerialPort.Services
         {
             if (!_port.IsOpen) throw new InvalidOperationException("串口未打开。");
             byte[] buffer = encoding.GetBytes(text);
-            _port.BaseStream.Write(buffer, 0, buffer.Length);
+            try
+            {
+                _port.BaseStream.Write(buffer, 0, buffer.Length);
+            }
+            catch (Exception ex)
+            {
+                // 设备已拔出（COM 号复用等）时写入抛 IO 类异常：广播 PortGone 后静默，由 UI 提示
+                if (HandleDeviceError(ex)) return;
+                throw;
+            }
         }
 
         /// <summary>以十六进制字节方式发送数据。</summary>
         public void SendBytes(byte[] data)
         {
             if (!_port.IsOpen) throw new InvalidOperationException("串口未打开。");
-            _port.BaseStream.Write(data, 0, data.Length);
+            try
+            {
+                _port.BaseStream.Write(data, 0, data.Length);
+            }
+            catch (Exception ex)
+            {
+                // 设备已拔出（COM 号复用等）时写入抛 IO 类异常：广播 PortGone 后静默，由 UI 提示
+                if (HandleDeviceError(ex)) return;
+                throw;
+            }
         }
 
         /// <summary>清空输入缓冲区。</summary>
@@ -124,22 +146,32 @@ namespace SerialPort.Services
                 _port.BaseStream.Read(buffer, 0, bytes);
 
                 // 切回 UI 线程
-                _syncContext.Post(state =>
-                {
-                    DataReceived?.Invoke(this, new DataReceivedEventArgs(buffer));
-                }, null);
+                Post(() => DataReceived?.Invoke(this, new DataReceivedEventArgs(buffer)));
             }
             catch (Exception ex)
             {
                 // 设备拔出但端口名未消失（COM 号被复用）时，读取会抛 IO 类异常；
-                // 通知 UI 层自动断开，避免状态停留在"已连接"
-                if (_port != null && _port.IsOpen && (ex is IOException || ex is UnauthorizedAccessException))
-                {
-                    _syncContext.Post(state => PortGone?.Invoke(this, EventArgs.Empty), null);
-                }
+                // 通过 HandleDeviceError 通知 UI 层自动断开，避免状态停留在"已连接"
+                HandleDeviceError(ex);
                 // 其余异常静默处理，避免后台线程崩溃
             }
         }
+
+        /// <summary>
+        /// 统一判定"设备已不可用"（拔出但端口名未消失等）：端口仍打开且异常为 IO 类时，
+        /// 通过 <see cref="PortGone"/> 事件通知 UI 层（已在 UI 线程上回调）；返回是否已按此处理。
+        /// 收发两条路径的设备失效判定都走这里，判定标准只需维护一处。
+        /// </summary>
+        private bool HandleDeviceError(Exception ex)
+        {
+            if (_port == null || !_port.IsOpen || !(ex is IOException || ex is UnauthorizedAccessException))
+                return false;
+            Post(() => PortGone?.Invoke(this, EventArgs.Empty));
+            return true;
+        }
+
+        /// <summary>把动作切回 UI 线程执行（后台线程事件回调统一走此入口）。</summary>
+        private void Post(Action action) => _syncContext.Post(_ => action(), null);
 
         public void Dispose()
         {

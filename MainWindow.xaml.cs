@@ -46,7 +46,7 @@ namespace SerialPort
             txtSavePath.Text = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 
             // 串口列表（初始填充不提示；运行期由定时器自动检测变化）
-            RefreshPortList(false);
+            RefreshPortList(SerialPortService.GetAvailablePorts(), false);
 
             // 波特率
             cboBaudRate.Items.Clear();
@@ -116,75 +116,88 @@ namespace SerialPort
         // ============================================================
         private void TimerPortCheck_Tick(object sender, EventArgs e)
         {
+            string[] ports = SerialPortService.GetAvailablePorts();
+
+            // 拔出检测与列表刷新解耦：下拉展开时仅抑制列表刷新，断开检测照常进行
+            if (_service.IsOpen && !_service.IsOpenPortPresent(ports))
+                AutoDisconnect();
+
             // 下拉展开时不改 Items（避免重绘异常）；DropDownOpened 事件（每次打开下拉）会补刷
             if (cboPortName.IsDropDownOpen) return;
-            RefreshPortList();
+            RefreshPortList(ports);
         }
 
         /// <summary>打开下拉时刷新一次，保证用户看到的列表是最新的（PortListEquals 兜底去重）。</summary>
-        private void cboPortName_DropDown(object sender, EventArgs e) => RefreshPortList();
+        private void cboPortName_DropDown(object sender, EventArgs e) =>
+            RefreshPortList(SerialPortService.GetAvailablePorts());
 
-        private void RefreshPortList(bool notify = true)
+        private void RefreshPortList(string[] ports, bool notify = true)
         {
-            string[] ports = SerialPortService.GetAvailablePorts();
-
-            // 拔出检测：已连接端口从系统中消失 → 自动断开（同步，优先于列表重建）
-            if (_service.IsOpen && Array.IndexOf(ports, _service.PortName) < 0)
-                AutoDisconnect($"检测到 {_service.PortName} 已拔出，串口已自动断开");
-
             if (PortListEquals(ports)) return;   // 集合无变化：不动列表，也不触发描述查询
 
             // 先以纯端口号占位重建（列表立即反映真实端口，描述查询完成后回填）
-            string fallback = (cboPortName.SelectedItem as SerialPortItem)?.PortName;
-            RebuildPortItems(ports, null, fallback);
+            RebuildPortItems(ports, null);
 
             if (notify) UpdateStatus("检测到端口变化，已更新列表");
 
-            // 异步查询设备描述；完成后切回 UI 线程回填。
-            // 集合再次变化时丢弃本次结果（不直接触发新查询），由下轮 tick 自然补查——收敛无循环
-            string[] snapshot = ports;
+            ScheduleDescriptionBackfill(ports);
+        }
+
+        /// <summary>
+        /// 异步查询设备描述；完成后切回 UI 线程回填。
+        /// 集合再次变化时丢弃本次结果（不直接触发新查询），由下轮 tick 自然补查——收敛无循环。
+        /// </summary>
+        private void ScheduleDescriptionBackfill(string[] ports)
+        {
             Task.Run(() => PortDeviceInfo.GetDescriptions()).ContinueWith(t =>
             {
-                if (!PortListEquals(snapshot)) return;   // 集合已变化：丢弃本次结果
-                RebuildPortItems(snapshot, t.Result, fallback);
+                if (!PortListEquals(ports)) return;   // 集合已变化：丢弃本次结果
+                RebuildPortItems(ports, t.Result);
             }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
         /// <summary>
         /// 重建端口下拉框 Items（SerialPortItem 列表）。
-        /// 选中恢复规则：优先保留当前选中（用户可能已手动改选），其次原选中 fallback；
-        /// 都失效且未连接时选第一个 / 清空；已连接（端口仍在列表中）不强制改选。
+        /// 选中恢复规则：优先保留当前选中（用户可能已手动改选）；
+        /// 失效且未连接时选第一个 / 清空；已连接（端口仍在列表中）不强制改选。
         /// </summary>
-        private void RebuildPortItems(string[] ports, Dictionary<string, string> descriptions, string fallback)
+        private void RebuildPortItems(string[] ports, Dictionary<string, string> descriptions)
         {
-            string keep = (cboPortName.SelectedItem as SerialPortItem)?.PortName ?? fallback;
+            string keep = (cboPortName.SelectedItem as SerialPortItem)?.PortName;
 
             cboPortName.Items.Clear();
             foreach (string port in ports)
             {
                 string desc = null;
-                if (descriptions != null && descriptions.ContainsKey(port))
-                    desc = descriptions[port];
+                if (descriptions != null) descriptions.TryGetValue(port, out desc);
                 cboPortName.Items.Add(new SerialPortItem(port, desc));
             }
 
             int keepIndex = keep != null ? Array.IndexOf(ports, keep) : -1;
             if (keepIndex >= 0)
-                cboPortName.SelectedIndex = keepIndex;   // 保留当前/原选中项
+                cboPortName.SelectedIndex = keepIndex;   // 保留当前选中项
             else if (!_service.IsOpen)
                 cboPortName.SelectedIndex = ports.Length > 0 ? 0 : -1;   // 选中项消失且未连接 → 选第一个 / 清空
             // 串口已打开：不强制改选、不动连接
         }
 
-        /// <summary>集合比较（GetPortNames 顺序不稳，用 Contains 判断而非按下标；只比较端口名）。</summary>
+        /// <summary>集合比较（GetPortNames 顺序不稳，用存在性判断而非按下标；只比较端口名，不分配临时数组）。</summary>
         private bool PortListEquals(string[] ports)
         {
             if (cboPortName.Items.Count != ports.Length) return false;
-            string[] current = new string[cboPortName.Items.Count];
-            for (int i = 0; i < cboPortName.Items.Count; i++)
-                current[i] = ((SerialPortItem)cboPortName.Items[i]).PortName;
             foreach (string port in ports)
-                if (Array.IndexOf(current, port) < 0) return false;
+            {
+                bool found = false;
+                for (int i = 0; i < cboPortName.Items.Count; i++)
+                {
+                    if (((SerialPortItem)cboPortName.Items[i]).PortName == port)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return false;
+            }
             return true;
         }
 
@@ -195,8 +208,7 @@ namespace SerialPort
         {
             if (_service.IsOpen)
             {
-                try { _service.Close(); }
-                catch { }
+                _service.Close();
                 return;
             }
 
@@ -238,15 +250,14 @@ namespace SerialPort
             if (!connected) UpdateStatus("已断开");
         }
 
-        /// <summary>接收路径发现设备已不可用（拔出且 COM 号复用）时自动断开。</summary>
-        private void OnPortGone(object sender, EventArgs e) =>
-            AutoDisconnect($"检测到 {_service.PortName} 已拔出，串口已自动断开");
+        /// <summary>收发路径发现设备已不可用（拔出且 COM 号复用）时自动断开。</summary>
+        private void OnPortGone(object sender, EventArgs e) => AutoDisconnect();
 
         /// <summary>设备拔出等场景的自动断开：关闭串口（Close 内部保证事件发出、按钮复位）并提示。</summary>
-        private void AutoDisconnect(string reason)
+        private void AutoDisconnect()
         {
             _service.Close();
-            UpdateStatus(reason);
+            UpdateStatus($"检测到 {_service.PortName} 已拔出，串口已自动断开");
         }
 
         // ============================================================
@@ -366,12 +377,7 @@ namespace SerialPort
             }
             catch (Exception ex)
             {
-                // 端口对象仍打开但写入失败（设备被拔出且 COM 号复用）→ 自动断开，不弹窗
-                if (_service.IsOpen && (ex is IOException || ex is UnauthorizedAccessException))
-                {
-                    AutoDisconnect($"检测到 {_service.PortName} 已拔出，串口已自动断开");
-                    return;
-                }
+                // 设备拔出场景已由服务层 PortGone 事件处理（状态栏提示、不弹窗），这里只报告其余错误
                 MessageBox.Show($"发送失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
@@ -745,7 +751,7 @@ namespace SerialPort
         /// <summary>更新完成、新版本已启动：关闭串口后退出应用（由 UpdateService 在新版本进程启动后触发）。</summary>
         private void OnUpdateApplied(object sender, EventArgs e)
         {
-            try { _service.Close(); } catch { }
+            _service.Close();
             Application.Current.Shutdown();
         }
 
