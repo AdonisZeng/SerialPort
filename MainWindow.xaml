@@ -7,6 +7,94 @@
         WindowStartupLocation="CenterScreen"
         FontFamily="Segoe UI" FontSize="12"
         Background="{DynamicResource PanelBackBrush}">
+    <Window.Resources>
+        <!-- 下拉框共用模板：选中项文本过长时以省略号截断（保留下拉箭头），下拉选项仍完整显示。
+             文本列与箭头列分离，默认模板中选中项文字会覆盖箭头，导致长描述时箭头不可见。 -->
+        <ControlTemplate x:Key="ComboBoxTemplate" TargetType="{x:Type ComboBox}">
+            <Grid x:Name="templateRoot" SnapsToDevicePixels="True">
+                <!-- 箭头列固定 18px（与按钮模板内箭头区宽度一致）；若不固定列宽，文本列会
+                     延伸到箭头下方，导致文字与三角形重叠 -->
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="18" />
+                </Grid.ColumnDefinitions>
+                <ToggleButton x:Name="ToggleButton" Grid.ColumnSpan="2" Focusable="False"
+                              IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                    <ToggleButton.Template>
+                        <ControlTemplate TargetType="{x:Type ToggleButton}">
+                            <Border x:Name="toggleRoot"
+                                    Background="{DynamicResource {x:Static SystemColors.WindowBrushKey}}"
+                                    BorderBrush="{DynamicResource {x:Static SystemColors.ControlDarkBrushKey}}"
+                                    BorderThickness="1" SnapsToDevicePixels="True">
+                                <Border x:Name="splitBorder" Width="18" HorizontalAlignment="Right"
+                                        BorderBrush="{DynamicResource {x:Static SystemColors.ControlDarkBrushKey}}"
+                                        BorderThickness="1,0,0,0">
+                                    <Path x:Name="arrow" Data="M 0 0 L 4 4 L 8 0 Z"
+                                          Fill="{DynamicResource {x:Static SystemColors.ControlDarkDarkBrushKey}}"
+                                          HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,1,0,0" />
+                                </Border>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="toggleRoot" Property="Background"
+                                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                                    <Setter TargetName="toggleRoot" Property="BorderBrush"
+                                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                                    <Setter TargetName="arrow" Property="Fill"
+                                            Value="{DynamicResource {x:Static SystemColors.HighlightTextBrushKey}}" />
+                                </Trigger>
+                                <Trigger Property="IsChecked" Value="True">
+                                    <Setter TargetName="toggleRoot" Property="Background"
+                                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                                    <Setter TargetName="toggleRoot" Property="BorderBrush"
+                                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                                    <Setter TargetName="arrow" Property="Fill"
+                                            Value="{DynamicResource {x:Static SystemColors.HighlightTextBrushKey}}" />
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter TargetName="toggleRoot" Property="Background"
+                                            Value="{DynamicResource {x:Static SystemColors.ControlBrushKey}}" />
+                                    <Setter TargetName="toggleRoot" Property="BorderBrush"
+                                            Value="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
+                                    <Setter TargetName="arrow" Property="Fill"
+                                            Value="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </ToggleButton.Template>
+                </ToggleButton>
+                <!-- 选中项文本：限定在文本列内，超出部分以省略号截断。
+                     用普通 Binding（而非 TemplateBinding）绑定 SelectionBoxItem，
+                     TemplateBinding 不做对象→字符串转换，会导致选中项不显示。 -->
+                <TextBlock Grid.Column="0" IsHitTestVisible="False"
+                           Text="{Binding SelectionBoxItem, RelativeSource={RelativeSource TemplatedParent}}"
+                           TextTrimming="CharacterEllipsis"
+                           VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                           HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                           Margin="5,0,0,0"
+                           Foreground="{TemplateBinding Foreground}" />
+                <Popup x:Name="PART_Popup" Grid.ColumnSpan="2" AllowsTransparency="True" Margin="1"
+                       IsOpen="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                       PopupAnimation="{DynamicResource {x:Static SystemParameters.ComboBoxPopupAnimationKey}}"
+                       Placement="Bottom">
+                    <!-- 下拉面板：MinWidth 与下拉框同宽，内容更宽时可扩展（完整显示端口描述） -->
+                    <Border x:Name="DropDownBorder"
+                            MinWidth="{Binding ActualWidth, ElementName=ToggleButton}"
+                            MaxHeight="{TemplateBinding MaxDropDownHeight}"
+                            Background="{DynamicResource {x:Static SystemColors.WindowBrushKey}}"
+                            BorderBrush="{DynamicResource {x:Static SystemColors.WindowFrameBrushKey}}"
+                            BorderThickness="1">
+                        <ScrollViewer x:Name="DropDownScrollViewer">
+                            <Grid RenderOptions.ClearTypeHint="Enabled">
+                                <ItemsPresenter x:Name="ItemsPresenter"
+                                                KeyboardNavigation.DirectionalNavigation="Contained" />
+                            </Grid>
+                        </ScrollViewer>
+                    </Border>
+                </Popup>
+            </Grid>
+        </ControlTemplate>
+    </Window.Resources>
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -81,36 +169,42 @@
                 <!-- 行0：端口号 / 波特率 / 数据位 -->
                 <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" Margin="0,0,0,8">
                     <Label Content="端口号" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
-                    <ComboBox x:Name="cboPortName" Width="240" Height="26" IsEditable="False"
+                    <ComboBox x:Name="cboPortName" Width="102" Height="26" IsEditable="False"
                               VerticalContentAlignment="Center"
+                              Template="{StaticResource ComboBoxTemplate}"
                               DropDownOpened="cboPortName_DropDown" />
                 </StackPanel>
                 <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
                     <Label Content="波特率" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <ComboBox x:Name="cboBaudRate" Width="102" Height="26" IsEditable="False"
-                              VerticalContentAlignment="Center" />
+                              VerticalContentAlignment="Center"
+                              Template="{StaticResource ComboBoxTemplate}" />
                 </StackPanel>
                 <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal" Margin="0,0,0,8">
                     <Label Content="数据位" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <ComboBox x:Name="cboDataBits" Width="102" Height="26" IsEditable="False"
-                              VerticalContentAlignment="Center" />
+                              VerticalContentAlignment="Center"
+                              Template="{StaticResource ComboBoxTemplate}" />
                 </StackPanel>
 
                 <!-- 行1：停止位 / 校验位 / 流控 -->
                 <StackPanel Grid.Row="1" Grid.Column="0" Orientation="Horizontal" Margin="0,0,0,8">
                     <Label Content="停止位" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <ComboBox x:Name="cboStopBits" Width="102" Height="26" IsEditable="False"
-                              VerticalContentAlignment="Center" />
+                              VerticalContentAlignment="Center"
+                              Template="{StaticResource ComboBoxTemplate}" />
                 </StackPanel>
                 <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
                     <Label Content="校验位" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <ComboBox x:Name="cboParity" Width="102" Height="26" IsEditable="False"
-                              VerticalContentAlignment="Center" />
+                              VerticalContentAlignment="Center"
+                              Template="{StaticResource ComboBoxTemplate}" />
                 </StackPanel>
                 <StackPanel Grid.Row="1" Grid.Column="2" Orientation="Horizontal" Margin="0,0,0,8">
                     <Label Content="流　控" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <ComboBox x:Name="cboHandshake" Width="102" Height="26" IsEditable="False"
-                              VerticalContentAlignment="Center" />
+                              VerticalContentAlignment="Center"
+                              Template="{StaticResource ComboBoxTemplate}" />
                 </StackPanel>
 
                 <!-- 行2：打开串口按钮 + 复选项 -->
