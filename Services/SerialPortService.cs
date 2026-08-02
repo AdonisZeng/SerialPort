@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.IO.Ports;
 using System.Text;
 using System.Threading;
@@ -27,6 +28,12 @@ namespace SerialPort.Services
         public event EventHandler<bool> ConnectionChanged;
 
         public bool IsOpen => _port?.IsOpen ?? false;
+
+        /// <summary>当前端口名称（未打开时为空字符串）。</summary>
+        public string PortName => _port?.PortName ?? string.Empty;
+
+        /// <summary>后台读取发现设备已不可用（拔出等）时触发（已在 UI 线程上回调）。</summary>
+        public event EventHandler PortGone;
 
         public SerialPortService()
         {
@@ -66,12 +73,22 @@ namespace SerialPort.Services
             ConnectionChanged?.Invoke(this, true);
         }
 
-        /// <summary>关闭串口。</summary>
+        /// <summary>关闭串口。设备已拔出时 Close 可能抛异常，try/finally 保证断开事件总是发出。</summary>
         public void Close()
         {
             if (!_port.IsOpen) return;
-            _port.Close();
-            ConnectionChanged?.Invoke(this, false);
+            try
+            {
+                _port.Close();
+            }
+            catch
+            {
+                // 设备已拔出等场景下关闭可能失败：忽略，继续发出断开事件
+            }
+            finally
+            {
+                ConnectionChanged?.Invoke(this, false);
+            }
         }
 
         /// <summary>以文本方式发送数据。</summary>
@@ -112,9 +129,15 @@ namespace SerialPort.Services
                     DataReceived?.Invoke(this, new DataReceivedEventArgs(buffer));
                 }, null);
             }
-            catch
+            catch (Exception ex)
             {
-                // 串口读取异常时静默处理，避免后台线程崩溃
+                // 设备拔出但端口名未消失（COM 号被复用）时，读取会抛 IO 类异常；
+                // 通知 UI 层自动断开，避免状态停留在"已连接"
+                if (_port != null && _port.IsOpen && (ex is IOException || ex is UnauthorizedAccessException))
+                {
+                    _syncContext.Post(state => PortGone?.Invoke(this, EventArgs.Empty), null);
+                }
+                // 其余异常静默处理，避免后台线程崩溃
             }
         }
 
