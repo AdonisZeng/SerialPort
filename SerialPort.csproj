@@ -16,7 +16,7 @@
     <Deterministic>true</Deterministic>
     <ApplicationIcon>ICO\SerialPort.ico</ApplicationIcon>
     <!-- 单一版本源：每次发布新版本只改这里（x.y.z），构建时自动生成程序集版本号 -->
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
