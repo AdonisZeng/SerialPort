@@ -48,6 +48,7 @@
     <Reference Include="System.Net.Http" />
     <Reference Include="System.Runtime.Serialization" />
     <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Management" />
     <Reference Include="System.Xaml">
       <RequiredTargetFramework>4.0</RequiredTargetFramework>
     </Reference>
@@ -123,6 +124,7 @@
   <ItemGroup>
     <Compile Include="Services\SerialPortService.cs" />
     <Compile Include="Services\UpdateService.cs" />
+    <Compile Include="Services\PortDeviceInfo.cs" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="UI\ThemeManager.cs" />
