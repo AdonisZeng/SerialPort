@@ -33,6 +33,10 @@ namespace SerialPort
         // 筛选状态（_filterState 非空表示筛选已启用）
         private FilterState _filterState;
 
+        // 时间戳显示状态（状态机始终运行，与复选框勾选状态无关）
+        private bool _atLineStart = true;   // 当前处于行首（下一个非换行字符应补时间戳）
+        private bool _lastWasCr;            // 上一字符是 \r（用于区分 \r\n 与单独 \r，含跨块拆分）
+
         public MainWindow()
         {
             InitializeComponent();
@@ -213,7 +217,7 @@ namespace SerialPort
 
             _receivedBytesTotal += e.Data.Length;
 
-            string increment = GetIncrementText(e.Data);
+            string increment = GetTimestampedText(GetIncrementText(e.Data));
 
             if (_filterState != null)
             {
@@ -249,6 +253,39 @@ namespace SerialPort
                 return sb.ToString();
             }
             return Encoding.UTF8.GetString(data);
+        }
+
+        /// <summary>
+        /// 给单次接收的增量文本补时间戳：每行行首加 [HH:mm:ss]。
+        /// 行以 \n、\r、\r\n（含跨块拆分的 \r+ 开头\n）终结；空行不加戳；
+        /// 仅当勾选"时间戳显示"时输出前缀，行首位置跟踪始终进行。
+        /// </summary>
+        private string GetTimestampedText(string increment)
+        {
+            StringBuilder sb = new StringBuilder(increment.Length + 12);
+            bool emitTimestamp = chkTimestamp.IsChecked == true;
+            bool atLineStart = _atLineStart;
+            bool lastWasCr = _lastWasCr;
+            foreach (char c in increment)
+            {
+                // 先判定上个字符：单独 \r 在此字符处终结上一行（须先于补戳检查，\r 后首个字符才能正确加戳）
+                if (lastWasCr)
+                {
+                    if (c != '\n') atLineStart = true;
+                    lastWasCr = false;
+                }
+                if (atLineStart && emitTimestamp && c != '\r' && c != '\n')
+                {
+                    sb.Append('[').Append(DateTime.Now.ToString("HH:mm:ss")).Append("] ");
+                    atLineStart = false;
+                }
+                sb.Append(c);
+                if (c == '\r') lastWasCr = true;         // 等待可能的 \n
+                else if (c == '\n') atLineStart = true;  // \n（或 \r\n 的 \n）终结一行
+            }
+            _atLineStart = atLineStart;
+            _lastWasCr = lastWasCr;
+            return sb.ToString();
         }
 
         // ============================================================
