@@ -81,7 +81,7 @@
                 <!-- 行0：端口号 / 波特率 / 数据位 -->
                 <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" Margin="0,0,0,8">
                     <Label Content="端口号" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
-                    <ComboBox x:Name="cboPortName" Width="102" Height="26" IsEditable="False"
+                    <ComboBox x:Name="cboPortName" Width="240" Height="26" IsEditable="False"
                               VerticalContentAlignment="Center"
                               DropDownOpened="cboPortName_DropDown" />
                 </StackPanel>
