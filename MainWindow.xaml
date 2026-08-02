@@ -119,6 +119,7 @@
                             Style="{StaticResource AccentButtonStyle}"
                             Background="{StaticResource PortOpenBrush}"
                             Width="88" Height="36" Margin="0,0,18,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkTimestamp" Content="时间戳显示" Margin="0,0,18,0" VerticalAlignment="Center" />
                     <CheckBox x:Name="chkSendHex" Content="16进制发送" Margin="0,0,18,0" VerticalAlignment="Center" />
                     <CheckBox x:Name="chkReceiveHex" Content="16进制显示" Margin="0,0,18,0" VerticalAlignment="Center" />
                     <CheckBox x:Name="chkSendNewLine" Content="追加换行符" IsChecked="True"
