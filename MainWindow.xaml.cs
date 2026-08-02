@@ -17,7 +17,9 @@ namespace SerialPort
     public partial class MainWindow : Window
     {
         private readonly SerialPortService _service = new SerialPortService();
+        private readonly UpdateService _updateService = new UpdateService();
         private readonly DispatcherTimer _timerPortCheck = new DispatcherTimer();
+        private bool _manualCheck;   // 手动检查标志：手动触发时结果/失败需要弹窗提示
         private long _receivedBytesTotal;
         private StreamWriter _saveFileWriter;   // 文件保存流（勾选“文件保存”时创建）
         private string _saveFilePath;           // 当前保存文件的完整路径
@@ -86,6 +88,12 @@ namespace SerialPort
             // 订阅服务事件（服务在 UI 线程构造，事件回调已在 UI 线程，可直接操作控件）
             _service.DataReceived += OnDataReceived;
             _service.ConnectionChanged += OnConnectionChanged;
+
+            // 订阅更新服务事件；启动时后台检查一次新版本（不阻塞界面）
+            _updateService.CheckCompleted += OnUpdateCheckCompleted;
+            _updateService.UpdateError += OnUpdateError;
+            _updateService.UpdateApplied += OnUpdateApplied;
+            _updateService.CheckForUpdatesAsync();
 
             Closed += (s, e) =>
             {
@@ -597,6 +605,53 @@ namespace SerialPort
             bool saveChecked = chkSaveFile.IsChecked == true;
             txtSaveFileName.IsReadOnly = !saveChecked || connected;
             btnModifyFileName.IsEnabled = saveChecked && !connected;
+        }
+
+        // ============================================================
+        // 软件更新（状态栏“检查更新”入口；启动时自动检查一次）
+        // ============================================================
+        private void BtnCheckUpdate_Click(object sender, RoutedEventArgs e)
+        {
+            _manualCheck = true;
+            UpdateStatus("正在检查更新…");
+            _updateService.CheckForUpdatesAsync();
+        }
+
+        private void OnUpdateCheckCompleted(object sender, UpdateCheckResult result)
+        {
+            if (result.IsUpdateAvailable)
+            {
+                UpdateStatus($"发现新版本 v{result.LatestVersion}");
+                var dlg = new UpdateDialog(_updateService, result);
+                dlg.ShowDialog();
+            }
+            else if (_manualCheck)
+            {
+                _manualCheck = false;
+                MessageBox.Show($"当前已是最新版本（v{result.CurrentVersion}）。", "检查更新",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            else
+            {
+                UpdateStatus($"已是最新版本 v{result.CurrentVersion}");
+            }
+        }
+
+        private void OnUpdateError(object sender, string message)
+        {
+            UpdateStatus(message);
+            if (_manualCheck)
+            {
+                _manualCheck = false;
+                MessageBox.Show(message, "检查更新", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
+        /// <summary>更新完成、新版本已启动：关闭串口后退出应用（由 UpdateService 在新版本进程启动后触发）。</summary>
+        private void OnUpdateApplied(object sender, EventArgs e)
+        {
+            try { _service.Close(); } catch { }
+            Application.Current.Shutdown();
         }
 
         // ============================================================

@@ -41,12 +41,5 @@ using System.Windows;
 )]
 
 
-// 程序集的版本信息由下列四个值组成: 
-//
-//      主版本
-//      次版本
-//      生成号
-//      修订号
-//
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+// 程序集版本号由构建过程自动生成（见 SerialPort.csproj 的 <Version> 属性与 BeforeCompile 目标），
+// 此处不再硬编码，避免两处维护。
