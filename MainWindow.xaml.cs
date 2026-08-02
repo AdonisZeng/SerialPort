@@ -651,7 +651,7 @@ namespace SerialPort
         {
             _manualCheck = true;
             UpdateStatus("正在检查更新…");
-            _updateService.CheckForUpdatesAsync();
+            _updateService.CheckForUpdatesAsync(forceRefresh: true);   // 手动检查：绕过本地缓存强制联网
         }
 
         private void OnUpdateCheckCompleted(object sender, UpdateCheckResult result)

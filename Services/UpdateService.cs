@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
@@ -26,6 +27,11 @@ namespace SerialPort.Services
         public const string GitHubRepo = "SerialPort";
 
         private const string LatestReleaseUrl = "https://api.github.com/repos/{0}/{1}/releases/latest";
+        /// <summary>网页端 latest release 地址：302 跳转到具体 tag，不受 API 配额限制（版本检查首选）。</summary>
+        private const string ReleaseLatestWebUrl = "https://github.com/{0}/{1}/releases/latest";
+
+        /// <summary>检查结果缓存有效期：此时间内直接使用本地缓存，不再发网络请求（自动检查用）。</summary>
+        private static readonly TimeSpan CacheMaxAge = TimeSpan.FromHours(12);
 
         private readonly SynchronizationContext _syncContext;
         private bool _checking;   // 检查中标志，避免重复触发
@@ -52,9 +58,10 @@ namespace SerialPort.Services
         public static Version CurrentVersion => Assembly.GetExecutingAssembly().GetName().Version;
 
         /// <summary>
-        /// 后台检查最新版本。notifyWhenUpToDate = true 时即使已是最新也触发 CheckCompleted（用于手动检查）。
+        /// 后台检查最新版本。notifyWhenUpToDate = true 时即使已是最新也触发 CheckCompleted（用于手动检查）；
+        /// forceRefresh = true 时绕过本地缓存强制联网检查（手动点击"检查更新"时用）。
         /// </summary>
-        public void CheckForUpdatesAsync(bool notifyWhenUpToDate = false)
+        public void CheckForUpdatesAsync(bool notifyWhenUpToDate = false, bool forceRefresh = false)
         {
             if (_checking) return;
             _checking = true;
@@ -63,10 +70,25 @@ namespace SerialPort.Services
             {
                 try
                 {
-                    UpdateCheckResult result = FetchLatestRelease();
+                    UpdateCheckResult result = null;
+                    if (!forceRefresh)
+                        result = TryReadCache();   // 缓存未过期直接使用，不发网络请求
+                    if (result == null)
+                    {
+                        result = FetchLatestRelease();
+                        WriteCache(result);        // 缓存最新结果（含"已是最新"状态），写失败静默忽略
+                    }
                     if (!notifyWhenUpToDate && !result.IsUpdateAvailable && result.LatestVersion == null)
                         return;   // 自动检查且仓库无 Release：静默
                     Post(() => CheckCompleted?.Invoke(this, result));
+                }
+                catch (RateLimitExceededException ex)
+                {
+                    Post(() => UpdateError?.Invoke(this, "GitHub 访问频率受限（rate limit exceeded），" + ex.Message + "。"));
+                }
+                catch (HttpRequestException)
+                {
+                    Post(() => UpdateError?.Invoke(this, "检查更新失败：无法连接到 GitHub，请检查网络后重试。"));
                 }
                 catch (Exception ex)
                 {
@@ -153,18 +175,76 @@ namespace SerialPort.Services
             });
         }
 
-        /// <summary>查询 GitHub 最新 Release 并解析为检查结果。</summary>
+        /// <summary>
+        /// 查询 GitHub 最新 Release 并解析为检查结果。
+        /// 版本检查走网页端 302 重定向（不消耗 API 配额），确认有新版本后才调 API 补全发布说明与附件地址。
+        /// </summary>
         private static UpdateCheckResult FetchLatestRelease()
         {
             var result = new UpdateCheckResult { CurrentVersion = CurrentVersion };
+
+            // 1. 网页端 /releases/latest → 302 跳转到 /releases/tag/vX.Y.Z，解析出最新版本
+            Version latest = FetchLatestVersionFromWeb();
+            if (latest == null)
+                return result;   // 仓库还没有任何 Release：视为“无可用更新”
+            result.LatestVersion = latest;
+            result.IsUpdateAvailable = latest.CompareTo(result.CurrentVersion) > 0;
+            if (!result.IsUpdateAvailable)
+                return result;
+
+            // 2. 有新版本才调 API 补全发布说明与附件（频率极低，偶发限流只影响真正的升级流程）
+            FillReleaseDetails(result);
+            return result;
+        }
+
+        /// <summary>
+        /// 通过网页端 /releases/latest 的 302 跳转解析最新 tag 版本。
+        /// 不访问 api.github.com，不受 API 每 IP 每小时 60 次的未认证配额限制。
+        /// </summary>
+        private static Version FetchLatestVersionFromWeb()
+        {
+            var handler = new HttpClientHandler { AllowAutoRedirect = false };   // 不跟随跳转，直接读 Location 头
+            using (var client = new HttpClient(handler))
+            {
+                client.DefaultRequestHeaders.Add("User-Agent", "SerialPort-Update-Checker");   // GitHub 要求 UA
+                using (HttpResponseMessage resp = client.GetAsync(string.Format(ReleaseLatestWebUrl, GitHubOwner, GitHubRepo)).Result)
+                {
+                    if (resp.StatusCode == HttpStatusCode.NotFound)
+                        return null;   // 仓库还没有任何 Release
+                    if (resp.StatusCode == HttpStatusCode.Forbidden)
+                        throw new RateLimitExceededException();   // 网页端被反爬限流
+                    if (resp.StatusCode != HttpStatusCode.Found && resp.StatusCode != HttpStatusCode.MovedPermanently)
+                    {
+                        resp.EnsureSuccessStatusCode();
+                        return null;   // 200 且无跳转（理论上不会出现）：视为无更新
+                    }
+
+                    // Location 形如 https://github.com/owner/repo/releases/tag/v1.0.0
+                    string location = resp.Headers.Location?.ToString() ?? "";
+                    const string marker = "/releases/tag/";
+                    int idx = location.LastIndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                    if (idx < 0) return null;
+                    return ParseTagVersion(Uri.UnescapeDataString(location.Substring(idx + marker.Length)));
+                }
+            }
+        }
+
+        /// <summary>通过 GitHub API 补全发布说明与附件地址（仅在有新版本时调用）。</summary>
+        private static void FillReleaseDetails(UpdateCheckResult result)
+        {
             using (var client = new HttpClient())
             {
                 client.DefaultRequestHeaders.Add("User-Agent", "SerialPort-Update-Checker");   // GitHub API 要求 UA
                 using (HttpResponseMessage resp = client.GetAsync(string.Format(LatestReleaseUrl, GitHubOwner, GitHubRepo)).Result)
                 {
-                    // 仓库还没有任何 Release：视为“无可用更新”
-                    if (resp.StatusCode == HttpStatusCode.NotFound)
-                        return result;
+                    // API 未认证配额耗尽：给出恢复时间提示，不再抛原始英文错误
+                    if (resp.StatusCode == HttpStatusCode.Forbidden)
+                    {
+                        string reset = resp.Headers.TryGetValues("X-RateLimit-Reset", out var values)
+                            ? "约 " + DateTimeOffset.FromUnixTimeSeconds(long.Parse(values.First())).ToLocalTime().ToString("HH:mm") + " 后恢复"
+                            : "请稍后再试";
+                        throw new RateLimitExceededException(reset);
+                    }
                     resp.EnsureSuccessStatusCode();
 
                     using (Stream stream = resp.Content.ReadAsStreamAsync().Result)
@@ -172,16 +252,11 @@ namespace SerialPort.Services
                         var serializer = new DataContractJsonSerializer(typeof(ReleaseInfo));
                         var release = (ReleaseInfo)serializer.ReadObject(stream);
 
-                        result.LatestVersion = ParseTagVersion(release.TagName);
                         result.ReleaseNotes = release.Body;
-                        if (result.LatestVersion == null) return result;
-
-                        result.IsUpdateAvailable = result.LatestVersion.CompareTo(result.CurrentVersion) > 0;
-                        if (!result.IsUpdateAvailable) return result;
 
                         // 从附件中按文件名定位程序 / 校验文件 / 配置文件
                         string exeName = Path.GetFileName(Assembly.GetExecutingAssembly().Location);
-                        if (release.Assets == null) return result;
+                        if (release.Assets == null) return;
                         foreach (ReleaseAsset asset in release.Assets)
                         {
                             if (string.Equals(asset.Name, exeName, StringComparison.OrdinalIgnoreCase))
@@ -194,9 +269,76 @@ namespace SerialPort.Services
                         // 校验文件或程序附件缺失时给出明确提示
                         if (string.IsNullOrEmpty(result.ExeUrl))
                             throw new IOException("Release 附件中找不到 " + exeName + "，发布不完整。");
-                        return result;
                     }
                 }
+            }
+        }
+
+        /// <summary>读取本地缓存；缓存缺失、过期或损坏时返回 null（调用方正常走网络检查）。</summary>
+        private static UpdateCheckResult TryReadCache()
+        {
+            try
+            {
+                if (!File.Exists(CacheFilePath)) return null;
+                using (var fs = new FileStream(CacheFilePath, FileMode.Open, FileAccess.Read))
+                {
+                    var serializer = new DataContractJsonSerializer(typeof(UpdateCheckCache));
+                    var cache = (UpdateCheckCache)serializer.ReadObject(fs);
+                    if (cache == null || DateTime.UtcNow - cache.CheckedAt > CacheMaxAge)
+                        return null;   // 已过期：需要重新检查
+                    Version latest = cache.LatestVersion == null ? null : Version.Parse(cache.LatestVersion);
+                    return new UpdateCheckResult
+                    {
+                        CurrentVersion = CurrentVersion,
+                        LatestVersion = latest,
+                        ReleaseNotes = cache.ReleaseNotes,
+                        ExeUrl = cache.ExeUrl,
+                        Sha256Url = cache.Sha256Url,
+                        ConfigUrl = cache.ConfigUrl,
+                        IsUpdateAvailable = latest != null && latest.CompareTo(CurrentVersion) > 0,
+                    };
+                }
+            }
+            catch
+            {
+                return null;   // 文件损坏 / 版本解析失败：忽略缓存，走网络检查
+            }
+        }
+
+        /// <summary>把本次检查结果写入本地缓存；写失败（如目录不可写）静默忽略，不影响检查流程。</summary>
+        private static void WriteCache(UpdateCheckResult result)
+        {
+            try
+            {
+                var cache = new UpdateCheckCache
+                {
+                    CheckedAt = DateTime.UtcNow,
+                    LatestVersion = result.LatestVersion?.ToString(),
+                    ReleaseNotes = result.ReleaseNotes,
+                    ExeUrl = result.ExeUrl,
+                    Sha256Url = result.Sha256Url,
+                    ConfigUrl = result.ConfigUrl,
+                };
+                Directory.CreateDirectory(Path.GetDirectoryName(CacheFilePath));
+                using (var fs = new FileStream(CacheFilePath, FileMode.Create, FileAccess.Write))
+                {
+                    var serializer = new DataContractJsonSerializer(typeof(UpdateCheckCache));
+                    serializer.WriteObject(fs, cache);
+                }
+            }
+            catch
+            {
+                // 缓存写失败不影响更新检查本身
+            }
+        }
+
+        /// <summary>检查结果缓存文件的完整路径（%LocalAppData%\SerialPort\update_check.cache）。</summary>
+        private static string CacheFilePath
+        {
+            get
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SerialPort");
+                return Path.Combine(dir, "update_check.cache");
             }
         }
 
@@ -316,5 +458,37 @@ namespace SerialPort.Services
 
         [DataMember(Name = "browser_download_url")]
         public string DownloadUrl { get; set; }
+    }
+
+    /// <summary>检查结果缓存模型（序列化为 JSON 存于 %LocalAppData%\SerialPort\update_check.cache）。</summary>
+    [DataContract]
+    internal sealed class UpdateCheckCache
+    {
+        /// <summary>检查完成时间（UTC），用于判断缓存是否过期。</summary>
+        [DataMember(Name = "checked_at")]
+        public DateTime CheckedAt { get; set; }
+
+        /// <summary>最新版本号字符串（"1.0.0"）；仓库无 Release 时为 null。</summary>
+        [DataMember(Name = "latest_version")]
+        public string LatestVersion { get; set; }
+
+        [DataMember(Name = "release_notes")]
+        public string ReleaseNotes { get; set; }
+
+        [DataMember(Name = "exe_url")]
+        public string ExeUrl { get; set; }
+
+        [DataMember(Name = "sha256_url")]
+        public string Sha256Url { get; set; }
+
+        [DataMember(Name = "config_url")]
+        public string ConfigUrl { get; set; }
+    }
+
+    /// <summary>GitHub 接口访问频率受限（HTTP 403 rate limit exceeded）时抛出，由服务层翻译成友好提示。</summary>
+    internal sealed class RateLimitExceededException : Exception
+    {
+        public RateLimitExceededException() { }
+        public RateLimitExceededException(string message) : base(message) { }
     }
 }
