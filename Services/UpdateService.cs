@@ -21,7 +21,7 @@ namespace SerialPort.Services
     {
         // ===== 发布前检查：以下两个常量必须与你的 GitHub 仓库匹配 =====
         /// <summary>GitHub 用户名（仓库所有者）。</summary>
-        public const string GitHubOwner = "zengguangnan";
+        public const string GitHubOwner = "AdonisZeng";
         /// <summary>GitHub 仓库名。</summary>
         public const string GitHubRepo = "SerialPort";
 
