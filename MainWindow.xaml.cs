@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
@@ -44,17 +44,26 @@ namespace SerialPort
         {
             InitializeComponent();
 
-            // 文件保存：默认保存路径为“我的文档”
-            txtSavePath.Text = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            // 文件保存：优先恢复上次路径，否则使用“我的文档”
+            string lastSavePath = Properties.Settings.Default.LastSavePath;
+            txtSavePath.Text = !string.IsNullOrWhiteSpace(lastSavePath)
+                ? lastSavePath
+                : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
 
             // 串口列表（初始填充不提示；运行期由定时器自动检测变化）
             RefreshPortList(SerialPortService.GetAvailablePorts(), false);
 
-            // 波特率
+            // 波特率：固定速率 + Custom（可编辑输入任意值）
             cboBaudRate.Items.Clear();
-            foreach (BaudRate br in Enum.GetValues(typeof(BaudRate)))
-                cboBaudRate.Items.Add((int)br);
-            cboBaudRate.SelectedItem = (int)BaudRate.Baud9600;
+            cboBaudRate.Items.Add("Custom");
+            foreach (int rate in SerialPortService.StandardBaudRates)
+                cboBaudRate.Items.Add(rate);
+            cboBaudRate.SelectedItem = 9600;
+
+            // 加载上次关闭前保存的波特率（Custom 数值也能恢复）
+            int lastBaudRate = Properties.Settings.Default.LastBaudRate;
+            if (lastBaudRate > 0)
+                cboBaudRate.Text = lastBaudRate.ToString();
 
             // 数据位
             cboDataBits.Items.Clear();
@@ -107,6 +116,16 @@ namespace SerialPort
                 _timerPortCheck.Stop();       // 停止端口轮询
                 _saveFileWriter?.Dispose();   // 关闭保存文件
                 _service.Dispose();           // 关闭串口并释放资源（Dispose 幂等）
+
+                // 保存当前波特率与文件保存路径，下次启动自动恢复
+                if (int.TryParse(cboBaudRate.Text, out int baudRate) && baudRate > 0)
+                    Properties.Settings.Default.LastBaudRate = baudRate;
+
+                string savePath = txtSavePath.Text?.Trim();
+                if (!string.IsNullOrWhiteSpace(savePath))
+                    Properties.Settings.Default.LastSavePath = savePath;
+
+                Properties.Settings.Default.Save();
             };
 
             UpdateStatus("就绪");
@@ -259,17 +278,18 @@ namespace SerialPort
             }
             try
             {
+                int baudRate = ParseBaudRate(cboBaudRate.Text);
                 var config = new SerialPortConfig
                 {
                     PortName = item.PortName,
-                    BaudRate = (BaudRate)Convert.ToInt32(cboBaudRate.SelectedItem),
+                    BaudRate = baudRate,
                     DataBits = (DataBits)Convert.ToInt32(cboDataBits.SelectedItem),
                     StopBits = ParseStopBits(cboStopBits.SelectedItem.ToString()),
                     Parity = ParseParity(cboParity.SelectedItem.ToString()),
                     Handshake = ParseHandshake(cboHandshake.SelectedItem.ToString())
                 };
                 _service.Open(config);
-                UpdateStatus($"已连接 {config.PortName} @ {(int)config.BaudRate}");
+                UpdateStatus($"已连接 {config.PortName} @ {config.BaudRate}");
             }
             catch (Exception ex)
             {
@@ -826,6 +846,18 @@ namespace SerialPort
                 case "XOn/XOff": return Handshake.XOnXOff;
                 default: return Handshake.None;
             }
+        }
+
+        /// <summary>解析波特率：Custom 占位项或未输入时抛出异常提示用户。</summary>
+        private static int ParseBaudRate(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text) || text.Trim() == "Custom")
+                throw new FormatException("请选择或输入具体波特率数值。");
+
+            if (!int.TryParse(text.Trim(), out int value) || value <= 0)
+                throw new FormatException("波特率必须是正整数。");
+
+            return value;
         }
 
         /// <summary>将 "A1 B2 3C" 形式的字符串解析为字节数组，忽略空格/换行。</summary>

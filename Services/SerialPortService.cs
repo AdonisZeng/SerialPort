@@ -49,6 +49,15 @@ namespace SerialPort.Services
         /// <summary>获取系统中所有可用串口名称。</summary>
         public static string[] GetAvailablePorts() => SerialPortType.GetPortNames();
 
+        /// <summary>标准波特率列表（升序，供 UI 下拉框使用）。</summary>
+        public static readonly int[] StandardBaudRates = new[]
+        {
+            110, 300, 600, 1200, 2400, 4800, 9600,
+            14400, 19200, 38400, 56000, 57600, 115200,
+            128000, 230400, 256000, 460800, 500000, 512000,
+            600000, 750000, 921600, 1000000, 1500000, 2000000
+        };
+
         /// <summary>销毁当前端口实例（摘事件、关闭、释放）并清空字段；任何异常都吞掉。</summary>
         private void DisposePort()
         {
@@ -82,7 +91,7 @@ namespace SerialPort.Services
         private static void ApplyConfig(SerialPortType port, SerialPortConfig config)
         {
             port.PortName = config.PortName;
-            port.BaudRate = (int)config.BaudRate;
+            port.BaudRate = config.BaudRate;
             port.DataBits = (int)config.DataBits;
             port.StopBits = config.StopBits;
             port.Parity = config.Parity;
@@ -248,24 +257,11 @@ namespace SerialPort.Services
     public sealed class SerialPortConfig
     {
         public string PortName { get; set; } = "COM1";
-        public BaudRate BaudRate { get; set; } = BaudRate.Baud9600;
+        public int BaudRate { get; set; } = 9600;
         public DataBits DataBits { get; set; } = DataBits.Eight;
         public StopBits StopBits { get; set; } = System.IO.Ports.StopBits.One;
         public Parity Parity { get; set; } = Parity.None;
         public Handshake Handshake { get; set; } = Handshake.None;
-    }
-
-    /// <summary>常用波特率枚举（便于 UI 绑定）。</summary>
-    public enum BaudRate
-    {
-        Baud1200 = 1200,
-        Baud2400 = 2400,
-        Baud4800 = 4800,
-        Baud9600 = 9600,
-        Baud19200 = 19200,
-        Baud38400 = 38400,
-        Baud57600 = 57600,
-        Baud115200 = 115200
     }
 
     /// <summary>数据位枚举。</summary>

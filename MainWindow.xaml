@@ -1,4 +1,4 @@
-﻿<Window x:Class="SerialPort.MainWindow"
+<Window x:Class="SerialPort.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="SerialPort  串口调试工具"
@@ -66,13 +66,23 @@
                 <!-- 选中项文本：限定在文本列内，超出部分以省略号截断。
                      用普通 Binding（而非 TemplateBinding）绑定 SelectionBoxItem，
                      TemplateBinding 不做对象→字符串转换，会导致选中项不显示。 -->
-                <TextBlock Grid.Column="0" IsHitTestVisible="False"
+                <TextBlock x:Name="SelectionTextBlock" Grid.Column="0" IsHitTestVisible="False"
                            Text="{Binding SelectionBoxItem, RelativeSource={RelativeSource TemplatedParent}}"
                            TextTrimming="CharacterEllipsis"
                            VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
                            HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
                            Margin="5,0,0,0"
                            Foreground="{TemplateBinding Foreground}" />
+                <TextBox x:Name="PART_EditableTextBox" Grid.Column="0"
+                         Visibility="Collapsed"
+                         Text="{TemplateBinding Text}"
+                         VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
+                         HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                         Margin="4,0,2,0"
+                         Background="Transparent"
+                         BorderThickness="0"
+                         CaretBrush="{TemplateBinding Foreground}"
+                         Foreground="{TemplateBinding Foreground}" />
                 <Popup x:Name="PART_Popup" Grid.ColumnSpan="2" AllowsTransparency="True" Margin="1"
                        IsOpen="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
                        PopupAnimation="{DynamicResource {x:Static SystemParameters.ComboBoxPopupAnimationKey}}"
@@ -93,6 +103,12 @@
                     </Border>
                 </Popup>
             </Grid>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsEditable" Value="True">
+                    <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible" />
+                    <Setter TargetName="SelectionTextBlock" Property="Visibility" Value="Collapsed" />
+                </Trigger>
+            </ControlTemplate.Triggers>
         </ControlTemplate>
     </Window.Resources>
     <Grid>
@@ -176,7 +192,7 @@
                 </StackPanel>
                 <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,0,0,8">
                     <Label Content="波特率" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
-                    <ComboBox x:Name="cboBaudRate" Width="102" Height="26" IsEditable="False"
+                    <ComboBox x:Name="cboBaudRate" Width="102" Height="26" IsEditable="True"
                               VerticalContentAlignment="Center"
                               Template="{StaticResource ComboBoxTemplate}" />
                 </StackPanel>
