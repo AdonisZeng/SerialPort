@@ -29,7 +29,7 @@ Visual Studio 2026 安装在 `D:\Software\Microsoft Visual Studio\18\Community`�
 
 - **`SerialPort`** —— `MainWindow`（XAML + 代码隐藏）。窗口为垂直分割布局：上半部分为接收显示区（只读 TextBox，带浮动清除按钮），下半部分为端口配置区（6 个下拉框：端口 / 波特率 / 数据位 / 停止位 / 校验位 / 握手协议）、复选框（十六进制发送 / 追加换行 / 十六进制显示 / 自动滚动）、连接开关按钮（绿色=未连接，红色=已连接）、发送区以及状态栏。它持有唯一的 `SerialPortService` 实例，在构造函数中订阅其事件，并通过私有解析器（`ParseStopBits`、`ParseParity`、`ParseHandshake`、`HexStringToBytes`）将界面字符串转换为串口配置。接收到的数据通过 `txtReceive.AppendText` 增量追加（WPF 中整体重新赋值会很慢），勾选自动滚动时用 `ScrollToEnd` 自动滚动到底部。
 
-- **`SerialPort.Services`** —— `SerialPortService`，一个 `sealed` 类，封装 `System.IO.Ports.SerialPort`（通过 `SerialPortType` 别名引用——根命名空间 `SerialPort` 遮蔽了框架类型）。界面所需的全部内容都在这一个文件里：服务本身、`SerialPortConfig`、`BaudRate` / `DataBits` 枚举以及 `DataReceivedEventArgs`。它实现 `IDisposable`，并在构造函数中捕获 `SynchronizationContext.Current`。
+- **`SerialPort.Services`** —— `SerialPortService`，一个 `sealed` 类，封装 `System.IO.Ports.SerialPort`（通过 `SerialPortType` 别名引用——根命名空间 `SerialPort` 遮蔽了框架类型）。界面所需的全部内容都在这一个文件里：服务本身、`SerialPortConfig`、`BaudRate` / `DataBits` 枚举以及 `DataReceivedEventArgs`。它实现 `IDisposable`，并在构造函数中捕获 `SynchronizationContext.Current`。服务区分**逻辑连接**（`IsConnected`，由保存的 `_config` 决定，设备拔出等待重插期间仍为 true，UI 按钮以它为据）与**物理连接**（`IsOpen`，底层端口是否真正打开）；设备拔出时**不会自动断开**，UI 定时器检测到端口重现后调用 `TryReconnect()` 按原配置重建端口实例自动重连（无 `PortGone` 事件）。端口实例在每次打开 / 重连时重建（设备拔出后旧实例内部流已损坏，不可复用）。
 
 - **`SerialPort.UI`** —— `ThemeManager`（静态类）和 `ThemeMode` 枚举。通过将 `Application.Current.Resources.MergedDictionaries` 的第 0 项替换为 `Themes/LightTheme.xaml` 或 `Themes/DarkTheme.xaml` 来切换浅色 / 深色主题；所有主题颜色都通过 `DynamicResource` 引用，因此替换后会立即重新着色。强调色（`PortOpenBrush` / `PortCloseBrush` / `SendBtnBrush`）是 App.xaml 中的常量，不随主题变化。主题不持久化——应用始终以浅色启动。
 
@@ -39,7 +39,7 @@ Visual Studio 2026 安装在 `D:\Software\Microsoft Visual Studio\18\Community`�
 
 ### 发送
 
-`SendText`（字符串 → 按调用方编码转为字节，界面中为 UTF-8）和 `SendBytes`（原始十六进制）都写入 `_port.BaseStream`，端口关闭时抛出 `InvalidOperationException`。`DiscardInBuffer` 目前只刷新流——注意它实际上并没有丢弃已接收的缓冲数据。
+`SendText`（字符串 → 按调用方编码转为字节，界面中为 UTF-8）和 `SendBytes`（原始十六进制）都写入 `_port.BaseStream`。逻辑未连接时抛出 `InvalidOperationException`；逻辑已连接但物理断开（设备拔出、等待重插）时**静默丢弃**，不抛异常。`DiscardInBuffer` 目前只刷新流——注意它实际上并没有丢弃已接收的缓冲数据。
 
 ## 端口命名冲突说明
 

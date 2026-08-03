@@ -22,6 +22,8 @@ namespace SerialPort
         private readonly UpdateService _updateService = new UpdateService();
         private readonly DispatcherTimer _timerPortCheck = new DispatcherTimer();
         private bool _manualCheck;   // 手动检查标志：手动触发时结果/失败需要弹窗提示
+        private bool _awaitingDevice;    // 已检测到设备拔出、正在等待重新插入（期间冻结端口列表）
+        private int _reconnectFailures;  // 连续重连失败次数（达到阈值后状态栏提示一次）
         private long _receivedBytesTotal;
         private StreamWriter _saveFileWriter;   // 文件保存流（勾选“文件保存”时创建）
         private string _saveFilePath;           // 当前保存文件的完整路径
@@ -85,15 +87,14 @@ namespace SerialPort
             cboHandshake.Items.Add("XOn/XOff");
             cboHandshake.SelectedIndex = 0;
 
-            // 端口自动检测：1.5 秒轮询一次
-            _timerPortCheck.Interval = TimeSpan.FromMilliseconds(1500);
+            // 端口自动检测：0.5 秒轮询一次（缩短以便更快捕获设备重启后的启动打印）
+            _timerPortCheck.Interval = TimeSpan.FromMilliseconds(500);
             _timerPortCheck.Tick += TimerPortCheck_Tick;
             _timerPortCheck.Start();
 
             // 订阅服务事件（服务在 UI 线程构造，事件回调已在 UI 线程，可直接操作控件）
             _service.DataReceived += OnDataReceived;
             _service.ConnectionChanged += OnConnectionChanged;
-            _service.PortGone += OnPortGone;
 
             // 订阅更新服务事件；启动时后台检查一次新版本（不阻塞界面）
             _updateService.CheckCompleted += OnUpdateCheckCompleted;
@@ -112,24 +113,62 @@ namespace SerialPort
         }
 
         // ============================================================
-        // 端口自动检测（1.5 秒轮询一次）
+        // 端口自动检测（0.5 秒轮询一次；拔出保持连接，重插自动重连）
         // ============================================================
         private void TimerPortCheck_Tick(object sender, EventArgs e)
         {
             string[] ports = SerialPortService.GetAvailablePorts();
 
-            // 拔出检测与列表刷新解耦：下拉展开时仅抑制列表刷新，断开检测照常进行
-            if (_service.IsOpen && !_service.IsOpenPortPresent(ports))
-                AutoDisconnect();
+            if (_service.IsConnected)
+            {
+                if (Array.IndexOf(ports, _service.PortName) >= 0)
+                {
+                    // 端口已出现：物理连接缺失（拔出 / IO 错误后）则尝试自动重连
+                    if (!_service.IsOpen)
+                    {
+                        if (_service.TryReconnect())
+                        {
+                            _awaitingDevice = false;
+                            _reconnectFailures = 0;
+                            UpdateStatus($"检测到 {_service.PortName} 已重新连接");
+                        }
+                        else if (++_reconnectFailures == 10)
+                        {
+                            // 连续重连失败（端口被占用等）：提示一次，继续每轮静默重试
+                            UpdateStatus("重连失败，请检查端口是否被其他程序占用");
+                        }
+                    }
+                    else
+                    {
+                        _awaitingDevice = false;   // 物理连接已在：防御性复位
+                    }
+                }
+                else if (!_awaitingDevice)
+                {
+                    // 首次检测到端口消失：置位冻结标志并提示一次（不刷屏）
+                    _awaitingDevice = true;
+                    UpdateStatus($"检测到 {_service.PortName} 已拔出，等待重新插入…");
+                }
+            }
+            else
+            {
+                _awaitingDevice = false;   // 未连接：防御性复位
+            }
 
+            // 等待重插期间冻结端口列表（跳过刷新，避免重建列表丢失选中项）
+            if (_awaitingDevice) return;
             // 下拉展开时不改 Items（避免重绘异常）；DropDownOpened 事件（每次打开下拉）会补刷
             if (cboPortName.IsDropDownOpen) return;
             RefreshPortList(ports);
         }
 
         /// <summary>打开下拉时刷新一次，保证用户看到的列表是最新的（PortListEquals 兜底去重）。</summary>
-        private void cboPortName_DropDown(object sender, EventArgs e) =>
+        private void cboPortName_DropDown(object sender, EventArgs e)
+        {
+            // 等待重插期间冻结列表：不刷新，避免重建列表丢失选中项
+            if (_awaitingDevice) return;
             RefreshPortList(SerialPortService.GetAvailablePorts());
+        }
 
         private void RefreshPortList(string[] ports, bool notify = true)
         {
@@ -176,7 +215,7 @@ namespace SerialPort
             int keepIndex = keep != null ? Array.IndexOf(ports, keep) : -1;
             if (keepIndex >= 0)
                 cboPortName.SelectedIndex = keepIndex;   // 保留当前选中项
-            else if (!_service.IsOpen)
+            else if (!_service.IsConnected)
                 cboPortName.SelectedIndex = ports.Length > 0 ? 0 : -1;   // 选中项消失且未连接 → 选第一个 / 清空
             // 串口已打开：不强制改选、不动连接
         }
@@ -206,7 +245,7 @@ namespace SerialPort
         // ============================================================
         private void BtnToggleConnect_Click(object sender, RoutedEventArgs e)
         {
-            if (_service.IsOpen)
+            if (_service.IsConnected)
             {
                 _service.Close();
                 return;
@@ -247,17 +286,11 @@ namespace SerialPort
                 ? (Brush)FindResource("PortCloseBrush")
                 : (Brush)FindResource("PortOpenBrush");
             UpdateFileEditState(connected);   // 串口打开时禁止修改文件名
-            if (!connected) UpdateStatus("已断开");
-        }
-
-        /// <summary>收发路径发现设备已不可用（拔出且 COM 号复用）时自动断开。</summary>
-        private void OnPortGone(object sender, EventArgs e) => AutoDisconnect();
-
-        /// <summary>设备拔出等场景的自动断开：关闭串口（Close 内部保证事件发出、按钮复位）并提示。</summary>
-        private void AutoDisconnect()
-        {
-            _service.Close();
-            UpdateStatus($"检测到 {_service.PortName} 已拔出，串口已自动断开");
+            if (!connected)
+            {
+                _awaitingDevice = false;   // 手动关闭等：解除冻结，恢复列表刷新
+                UpdateStatus("已断开");
+            }
         }
 
         // ============================================================
@@ -352,7 +385,7 @@ namespace SerialPort
         // ============================================================
         private void BtnSend_Click(object sender, RoutedEventArgs e)
         {
-            if (!_service.IsOpen)
+            if (!_service.IsConnected)
             {
                 MessageBox.Show("串口未连接，无法发送。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
@@ -377,7 +410,7 @@ namespace SerialPort
             }
             catch (Exception ex)
             {
-                // 设备拔出场景已由服务层 PortGone 事件处理（状态栏提示、不弹窗），这里只报告其余错误
+                // 设备拔出等待重连期间的发送已在服务层静默丢弃，这里只报告其余错误
                 MessageBox.Show($"发送失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
@@ -603,7 +636,7 @@ namespace SerialPort
                 _saveFileWriter = null;
             }
             txtSaveFileName.Text = string.Empty;
-            UpdateFileEditState(_service.IsOpen);
+            UpdateFileEditState(_service.IsConnected);
         }
 
         /// <summary>在保存路径下以默认文件名（年月日时分秒）新建文件；路径为空时回退到“我的文档”。</summary>
@@ -632,7 +665,7 @@ namespace SerialPort
                 chkSaveFile.IsChecked = false;   // 创建失败则取消勾选，保持状态一致
                 MessageBox.Show($"创建保存文件失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
             }
-            UpdateFileEditState(_service.IsOpen);
+            UpdateFileEditState(_service.IsConnected);
         }
 
         /// <summary>浏览按钮：弹出文件夹选择窗口，选择文件保存路径。</summary>
@@ -658,7 +691,7 @@ namespace SerialPort
         /// <summary>修改文件名（仅串口关闭时可用）：重命名磁盘上的当前保存文件。</summary>
         private void BtnModifyFileName_Click(object sender, RoutedEventArgs e)
         {
-            if (_service.IsOpen)
+            if (_service.IsConnected)
             {
                 MessageBox.Show("串口已连接，无法修改文件名。请先关闭串口。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
