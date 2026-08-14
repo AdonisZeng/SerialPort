@@ -16,7 +16,7 @@
     <Deterministic>true</Deterministic>
     <ApplicationIcon>ICO\SerialPort.ico</ApplicationIcon>
     <!-- 单一版本源：每次发布新版本只改这里（x.y.z），构建时自动生成程序集版本号 -->
-    <Version>1.0.6</Version>
+    <Version>1.1.0</Version>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
@@ -73,6 +73,14 @@
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
+    <Page Include="QuickCommandWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="FrameParserWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
     <Compile Include="App.xaml.cs">
       <DependentUpon>App.xaml</DependentUpon>
       <SubType>Code</SubType>
@@ -87,6 +95,14 @@
     </Compile>
     <Compile Include="UpdateDialog.xaml.cs">
       <DependentUpon>UpdateDialog.xaml</DependentUpon>
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="QuickCommandWindow.xaml.cs">
+      <DependentUpon>QuickCommandWindow.xaml</DependentUpon>
+      <SubType>Code</SubType>
+    </Compile>
+    <Compile Include="FrameParserWindow.xaml.cs">
+      <DependentUpon>FrameParserWindow.xaml</DependentUpon>
       <SubType>Code</SubType>
     </Compile>
   </ItemGroup>
@@ -125,6 +141,7 @@
     <Compile Include="Services\SerialPortService.cs" />
     <Compile Include="Services\UpdateService.cs" />
     <Compile Include="Services\PortDeviceInfo.cs" />
+    <Compile Include="Services\FrameParser.cs" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="UI\ThemeManager.cs" />

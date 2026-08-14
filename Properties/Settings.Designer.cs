@@ -44,5 +44,41 @@ namespace SerialPort.Properties
             get { return ((string)(this["LastSavePath"])); }
             set { this["LastSavePath"] = value; }
         }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute(null)]
+        public System.Collections.Specialized.StringCollection QuickCommands
+        {
+            get { return ((System.Collections.Specialized.StringCollection)(this["QuickCommands"])); }
+            set { this["QuickCommands"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("1000")]
+        public int TimerSendInterval
+        {
+            get { return ((int)(this["TimerSendInterval"])); }
+            set { this["TimerSendInterval"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("UTF-8")]
+        public string Encoding
+        {
+            get { return ((string)(this["Encoding"])); }
+            set { this["Encoding"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("0")]
+        public int Theme
+        {
+            get { return ((int)(this["Theme"])); }
+            set { this["Theme"] = value; }
+        }
     }
 }

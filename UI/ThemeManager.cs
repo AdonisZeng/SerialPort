@@ -1,4 +1,5 @@
-﻿using System.Windows;
+﻿using System;
+using System.Windows;
 
 namespace SerialPort.UI
 {
@@ -26,13 +27,30 @@ namespace SerialPort.UI
             Apply(Current == ThemeMode.Light ? ThemeMode.Dark : ThemeMode.Light);
         }
 
-        /// <summary>应用指定主题：替换 App 级合并字典的第 0 项（LightTheme 必须排第一）。</summary>
+        /// <summary>
+        /// 应用指定主题：在 App 级合并字典中按 Source 定位主题字典并替换。
+        /// 不依赖字典位置约定（旧实现假设主题字典恒为第 0 项），找不到时才插入到最前。
+        /// </summary>
         public static void Apply(ThemeMode mode)
         {
             Current = mode;
             string source = mode == ThemeMode.Dark ? "Themes/DarkTheme.xaml" : "Themes/LightTheme.xaml";
-            Application.Current.Resources.MergedDictionaries[0] =
-                new ResourceDictionary { Source = new System.Uri(source, System.UriKind.Relative) };
+            string other = mode == ThemeMode.Dark ? "Themes/LightTheme.xaml" : "Themes/DarkTheme.xaml";
+
+            var dictionaries = Application.Current.Resources.MergedDictionaries;
+            for (int i = 0; i < dictionaries.Count; i++)
+            {
+                string current = dictionaries[i].Source?.OriginalString ?? string.Empty;
+                if (current.EndsWith(source, StringComparison.OrdinalIgnoreCase) ||
+                    current.EndsWith(other, StringComparison.OrdinalIgnoreCase))
+                {
+                    dictionaries[i] = new ResourceDictionary { Source = new Uri(source, UriKind.Relative) };
+                    return;
+                }
+            }
+
+            // 防御：合并字典中不存在主题项（理论上不会发生，App.xaml 启动即含 LightTheme）
+            dictionaries.Insert(0, new ResourceDictionary { Source = new Uri(source, UriKind.Relative) });
         }
     }
 }

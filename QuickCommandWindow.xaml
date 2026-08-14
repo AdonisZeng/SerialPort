@@ -1,0 +1,69 @@
+<Window x:Class="SerialPort.QuickCommandWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="快捷指令" Width="500" Height="440" MinWidth="440" MinHeight="360"
+        WindowStartupLocation="CenterOwner"
+        FontFamily="Segoe UI" FontSize="12"
+        Background="{DynamicResource PanelBackBrush}"
+        ShowInTaskbar="False">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <!-- 命令列表 -->
+            <RowDefinition Height="Auto" />
+            <!-- 编辑区 -->
+            <RowDefinition Height="Auto" />
+            <!-- 按钮行 -->
+            <RowDefinition Height="Auto" />
+            <!-- 状态行 -->
+        </Grid.RowDefinitions>
+
+        <ListBox x:Name="lstCommands" Grid.Row="0" Margin="0,0,0,8"
+                 Background="{DynamicResource InputBackBrush}"
+                 Foreground="{DynamicResource InputForeBrush}"
+                 BorderBrush="{DynamicResource SecondaryBtnBorderBrush}"
+                 SelectionChanged="LstCommands_SelectionChanged"
+                 MouseDoubleClick="LstCommands_MouseDoubleClick" />
+
+        <!-- 编辑区：名称 + 内容 -->
+        <Grid Grid.Row="1" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="70" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <Label Content="名　称" Padding="0" VerticalAlignment="Center" Margin="0,0,6,8" />
+            <TextBox x:Name="txtName" Grid.Column="1" Height="24" Margin="0,0,0,8"
+                     VerticalContentAlignment="Center" />
+            <Label Grid.Row="1" Content="内　容" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
+            <TextBox x:Name="txtText" Grid.Row="1" Grid.Column="1" Height="52"
+                     TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                     FontFamily="Consolas" FontSize="10pt" />
+        </Grid>
+
+        <!-- 按钮行 -->
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,8">
+            <Button x:Name="btnAdd" Content="添加/更新" Click="BtnAdd_Click"
+                    Style="{StaticResource SecondaryButtonStyle}" Width="86" Height="26" Margin="0,0,8,0" />
+            <Button x:Name="btnDelete" Content="删除" Click="BtnDelete_Click"
+                    Style="{StaticResource SecondaryButtonStyle}" Width="60" Height="26" Margin="0,0,8,0" />
+            <Button x:Name="btnUp" Content="上移" Click="BtnUp_Click"
+                    Style="{StaticResource SecondaryButtonStyle}" Width="60" Height="26" Margin="0,0,8,0" />
+            <Button x:Name="btnDown" Content="下移" Click="BtnDown_Click"
+                    Style="{StaticResource SecondaryButtonStyle}" Width="60" Height="26" Margin="0,0,8,0" />
+            <Button x:Name="btnSend" Content="发送选中" Click="BtnSend_Click"
+                    Style="{StaticResource AccentButtonStyle}"
+                    Background="{StaticResource SendBtnBrush}"
+                    Width="86" Height="26" Margin="0,0,8,0" />
+            <Button x:Name="btnClose" Content="关闭" Click="BtnClose_Click"
+                    Style="{StaticResource SecondaryButtonStyle}" Width="60" Height="26" />
+        </StackPanel>
+
+        <TextBlock x:Name="txtStatus" Grid.Row="3"
+                   Foreground="{DynamicResource StatusTextBrush}"
+                   Text="选中指令后可直接发送；双击列表项也可发送" TextTrimming="CharacterEllipsis" />
+    </Grid>
+</Window>

@@ -34,9 +34,11 @@
         <TextBlock Grid.Row="2" Margin="0,14,0,4" Text="更新说明："
                    Foreground="{DynamicResource TextPrimaryBrush}" />
 
-        <TextBox x:Name="txtReleaseNotes" Grid.Row="3" IsReadOnly="True" TextWrapping="Wrap"
-                 VerticalScrollBarVisibility="Auto" FontFamily="Microsoft YaHei UI" FontSize="11"
-                 Padding="6" />
+        <RichTextBox x:Name="txtReleaseNotes" Grid.Row="3" IsReadOnly="True"
+                     VerticalScrollBarVisibility="Auto" FontFamily="Microsoft YaHei UI" FontSize="11"
+                     Padding="6" Background="{DynamicResource InputBackBrush}"
+                     Foreground="{DynamicResource InputForeBrush}"
+                     BorderBrush="{DynamicResource SecondaryBtnBorderBrush}" />
 
         <!-- 下载进度（开始更新后可见） -->
         <StackPanel x:Name="panelProgress" Grid.Row="4" Margin="0,12,0,0" Visibility="Collapsed">

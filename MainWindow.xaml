@@ -23,41 +23,41 @@
                     <ToggleButton.Template>
                         <ControlTemplate TargetType="{x:Type ToggleButton}">
                             <Border x:Name="toggleRoot"
-                                    Background="{DynamicResource {x:Static SystemColors.WindowBrushKey}}"
-                                    BorderBrush="{DynamicResource {x:Static SystemColors.ControlDarkBrushKey}}"
+                                    Background="{DynamicResource InputBackBrush}"
+                                    BorderBrush="{DynamicResource SecondaryBtnBorderBrush}"
                                     BorderThickness="1" SnapsToDevicePixels="True">
                                 <Border x:Name="splitBorder" Width="18" HorizontalAlignment="Right"
-                                        BorderBrush="{DynamicResource {x:Static SystemColors.ControlDarkBrushKey}}"
+                                        BorderBrush="{DynamicResource SecondaryBtnBorderBrush}"
                                         BorderThickness="1,0,0,0">
                                     <Path x:Name="arrow" Data="M 0 0 L 4 4 L 8 0 Z"
-                                          Fill="{DynamicResource {x:Static SystemColors.ControlDarkDarkBrushKey}}"
+                                          Fill="{DynamicResource InputForeBrush}"
                                           HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,1,0,0" />
                                 </Border>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
                                     <Setter TargetName="toggleRoot" Property="Background"
-                                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                                            Value="{DynamicResource ComboHoverBackBrush}" />
                                     <Setter TargetName="toggleRoot" Property="BorderBrush"
-                                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                                            Value="{DynamicResource ComboHoverBackBrush}" />
                                     <Setter TargetName="arrow" Property="Fill"
-                                            Value="{DynamicResource {x:Static SystemColors.HighlightTextBrushKey}}" />
+                                            Value="{DynamicResource InputForeBrush}" />
                                 </Trigger>
                                 <Trigger Property="IsChecked" Value="True">
                                     <Setter TargetName="toggleRoot" Property="Background"
-                                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                                            Value="{DynamicResource ComboHoverBackBrush}" />
                                     <Setter TargetName="toggleRoot" Property="BorderBrush"
-                                            Value="{DynamicResource {x:Static SystemColors.HighlightBrushKey}}" />
+                                            Value="{DynamicResource ComboHoverBackBrush}" />
                                     <Setter TargetName="arrow" Property="Fill"
-                                            Value="{DynamicResource {x:Static SystemColors.HighlightTextBrushKey}}" />
+                                            Value="{DynamicResource InputForeBrush}" />
                                 </Trigger>
                                 <Trigger Property="IsEnabled" Value="False">
                                     <Setter TargetName="toggleRoot" Property="Background"
-                                            Value="{DynamicResource {x:Static SystemColors.ControlBrushKey}}" />
+                                            Value="{DynamicResource InputBackBrush}" />
                                     <Setter TargetName="toggleRoot" Property="BorderBrush"
-                                            Value="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
+                                            Value="{DynamicResource SeparatorBrush}" />
                                     <Setter TargetName="arrow" Property="Fill"
-                                            Value="{DynamicResource {x:Static SystemColors.GrayTextBrushKey}}" />
+                                            Value="{DynamicResource SeparatorBrush}" />
                                 </Trigger>
                             </ControlTemplate.Triggers>
                         </ControlTemplate>
@@ -91,8 +91,8 @@
                     <Border x:Name="DropDownBorder"
                             MinWidth="{Binding ActualWidth, ElementName=ToggleButton}"
                             MaxHeight="{TemplateBinding MaxDropDownHeight}"
-                            Background="{DynamicResource {x:Static SystemColors.WindowBrushKey}}"
-                            BorderBrush="{DynamicResource {x:Static SystemColors.WindowFrameBrushKey}}"
+                            Background="{DynamicResource InputBackBrush}"
+                            BorderBrush="{DynamicResource SecondaryBtnBorderBrush}"
                             BorderThickness="1">
                         <ScrollViewer x:Name="DropDownScrollViewer">
                             <Grid RenderOptions.ClearTypeHint="Enabled">
@@ -146,6 +146,9 @@
                 <Button x:Name="btnSearchReceive" Content="搜索" Click="BtnSearchReceive_Click"
                         Style="{StaticResource SecondaryButtonStyle}"
                         Width="70" Height="26" Margin="0,0,0,6" ToolTip="在接收区中查找内容" />
+                <Button x:Name="btnFrameParser" Content="帧解析" Click="BtnFrameParser_Click"
+                        Style="{StaticResource SecondaryButtonStyle}"
+                        Width="70" Height="26" Margin="0,0,0,6" ToolTip="按帧头/帧尾提取完整帧并校验" />
                 <Button x:Name="btnClearReceive" Content="清空" Click="BtnClearReceive_Click"
                         Style="{StaticResource SecondaryButtonStyle}"
                         Width="70" Height="26" />
@@ -228,13 +231,24 @@
                     <Button x:Name="btnToggleConnect" Content="打开串口" Click="BtnToggleConnect_Click"
                             Style="{StaticResource AccentButtonStyle}"
                             Background="{StaticResource PortOpenBrush}"
-                            Width="88" Height="36" Margin="0,0,18,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkTimestamp" Content="时间戳显示" Margin="0,0,18,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkSendHex" Content="16进制发送" Margin="0,0,18,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkReceiveHex" Content="16进制显示" Margin="0,0,18,0" VerticalAlignment="Center" />
+                            Width="88" Height="36" Margin="0,0,12,0" VerticalAlignment="Center" />
+                    <Label Content="编码" Padding="0" VerticalAlignment="Center" Margin="0,0,4,0" />
+                    <ComboBox x:Name="cboEncoding" Width="76" Height="26" IsEditable="False"
+                              Margin="0,0,12,0" VerticalContentAlignment="Center"
+                              Template="{StaticResource ComboBoxTemplate}"
+                              SelectionChanged="CboEncoding_SelectionChanged"
+                              ToolTip="接收/发送文本编码（GBK 兼容 GB2312）" />
+                    <CheckBox x:Name="chkTimestamp" Content="时间戳显示" Margin="0,0,12,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkSendHex" Content="16进制发送" Margin="0,0,12,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkReceiveHex" Content="16进制显示" Margin="0,0,12,0" VerticalAlignment="Center" />
                     <CheckBox x:Name="chkSendNewLine" Content="追加换行符" IsChecked="True"
-                              Margin="0,0,18,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkAutoScroll" Content="自动滚动" IsChecked="True" Margin="0,0,18,0" VerticalAlignment="Center" />
+                              Margin="0,0,12,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkAutoScroll" Content="自动滚动" IsChecked="True" Margin="0,0,12,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkPauseReceive" Content="暂停显示" VerticalAlignment="Center"
+                              Checked="ChkPauseReceive_Changed" Unchecked="ChkPauseReceive_Changed"
+                              ToolTip="暂停接收区刷新，恢复后补齐显示（数据不丢失）" Margin="0,0,12,0" />
+                    <CheckBox x:Name="chkLocalEcho" Content="本地回显" VerticalAlignment="Center"
+                              ToolTip="发送的内容以 [TX] 前缀回显到接收区" Margin="0,0,12,0" />
                     <CheckBox x:Name="chkSaveFile" Content="文件保存" VerticalAlignment="Center"
                               Checked="ChkSaveFile_Changed" Unchecked="ChkSaveFile_Changed" />
                 </StackPanel>
@@ -285,6 +299,22 @@
                 <Button x:Name="btnClearSend" Content="清空" Click="BtnClearSend_Click"
                         Style="{StaticResource SecondaryButtonStyle}"
                         Width="70" Height="26" />
+                <TextBox x:Name="txtTimerInterval" Width="56" Height="26" Text="1000"
+                         VerticalContentAlignment="Center" Margin="10,0,4,0"
+                         ToolTip="定时发送间隔（毫秒），正整数" />
+                <Label Content="ms" Padding="0" VerticalAlignment="Center" Margin="0,0,8,0" />
+                <Button x:Name="btnTimerSend" Content="定时发送" Click="BtnTimerSend_Click"
+                        Style="{StaticResource SecondaryButtonStyle}"
+                        Width="80" Height="26" ToolTip="按设定间隔循环发送发送框内容，再次点击停止" />
+                <Button x:Name="btnQuickCommands" Content="快捷指令" Click="BtnQuickCommands_Click"
+                        Style="{StaticResource SecondaryButtonStyle}"
+                        Width="80" Height="26" Margin="8,0,0,0" ToolTip="管理并发送预设快捷指令" />
+                <CheckBox x:Name="chkDtr" Content="DTR" IsChecked="True" IsEnabled="False"
+                          Margin="18,0,2,0" VerticalAlignment="Center" Click="ChkPin_Changed"
+                          ToolTip="DTR 引脚电平（连接后可切换）" />
+                <CheckBox x:Name="chkRts" Content="RTS" IsEnabled="False"
+                          Margin="12,0,0,0" VerticalAlignment="Center" Click="ChkPin_Changed"
+                          ToolTip="RTS 引脚电平（连接后可切换）" />
             </StackPanel>
             <Button x:Name="btnThemeToggle" Content="深色模式" Click="BtnThemeToggle_Click"
                     Style="{StaticResource SecondaryButtonStyle}"
@@ -292,17 +322,20 @@
                     HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,0,12,0" Grid.Row="2" />
         </Grid>
 
-        <!-- 状态栏：左侧动态状态信息，右侧检查更新入口 -->
+        <!-- 状态栏：左侧动态状态信息，右侧统计区与检查更新入口 -->
         <Border Grid.Row="4" Height="22" Background="{DynamicResource TopBarBackBrush}">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <TextBlock x:Name="txtStatus" Text="  就绪" Margin="12,0,0,0"
                            VerticalAlignment="Center"
                            Foreground="{DynamicResource StatusTextBrush}" />
-                <Button x:Name="btnCheckUpdate" Grid.Column="1" Content="检查更新" Click="BtnCheckUpdate_Click"
+                <TextBlock x:Name="txtStats" Grid.Column="1" VerticalAlignment="Center" Margin="0,0,12,0"
+                           Foreground="{DynamicResource StatusTextBrush}" />
+                <Button x:Name="btnCheckUpdate" Grid.Column="2" Content="检查更新" Click="BtnCheckUpdate_Click"
                         Style="{StaticResource SecondaryButtonStyle}"
                         Width="82" Height="18" Margin="0,2,8,2"
                         FontSize="10" ToolTip="检查 GitHub 上是否有新版本" />

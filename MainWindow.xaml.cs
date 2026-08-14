@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
 using SerialPort.Services;
@@ -21,12 +23,32 @@ namespace SerialPort
         private readonly SerialPortService _service = new SerialPortService();
         private readonly UpdateService _updateService = new UpdateService();
         private readonly DispatcherTimer _timerPortCheck = new DispatcherTimer();
+        private readonly DispatcherTimer _timerStats = new DispatcherTimer();   // 1 秒刷新统计区
         private bool _manualCheck;   // 手动检查标志：手动触发时结果/失败需要弹窗提示
         private bool _awaitingDevice;    // 已检测到设备拔出、正在等待重新插入（期间冻结端口列表）
         private int _reconnectFailures;  // 连续重连失败次数（达到阈值后状态栏提示一次）
+        private FrameParserWindow _frameWindow;   // 帧解析窗口（非空 = 打开中，接收数据喂入）
         private long _receivedBytesTotal;
+        private long _sentBytesTotal;   // 累计发送字节数
+        private long _lastStatsRx;      // 上次统计快照的接收字节（计算速率）
+        private long _lastStatsTx;      // 上次统计快照的发送字节（计算速率）
+        private DateTime _connectStartedAt;   // 当前连接开始时间（断开后统计区显示 --:--:--）
+        private volatile bool _timerSending;   // 定时发送进行中（后台线程循环检查，volatile 保证可见性）
+        private int _timerGen;                 // 定时发送代次：每次启动递增，线程捕获自己的代次，代次不匹配立即退出
         private StreamWriter _saveFileWriter;   // 文件保存流（勾选“文件保存”时创建）
         private string _saveFilePath;           // 当前保存文件的完整路径
+
+        // 后台文件写入队列：写盘移出 UI 线程，避免高频数据时阻塞界面（锁内访问）
+        private readonly object _saveLock = new object();
+        private readonly Queue<string> _saveQueue = new Queue<string>();
+        private bool _saveDraining;
+
+        // 接收/发送文本编码与状态保持解码器（跨接收块解码；仅 UI 线程使用）
+        private Encoding _textEncoding = Encoding.UTF8;
+        private Decoder _textDecoder = Encoding.UTF8.GetDecoder();
+
+        // 暂停显示缓冲：暂停期间累积显示文本（上限保护），恢复时一次性补齐
+        private readonly StringBuilder _pausedBuffer = new StringBuilder();
 
         // 搜索状态（接收区查找）
         private string _searchTerm;
@@ -39,6 +61,9 @@ namespace SerialPort
 
         // 时间戳显示状态（状态机始终运行，与复选框勾选状态无关）
         private bool _atLineStart = true;   // 当前处于行首（下一个非换行字符应补时间戳）
+
+        // 接收区显示文本字符数（与 txtReceive.Text 同步维护，避免每块数据 O(n) 读 Length）
+        private int _receiveTextLength;
 
         public MainWindow()
         {
@@ -64,6 +89,19 @@ namespace SerialPort
             int lastBaudRate = Properties.Settings.Default.LastBaudRate;
             if (lastBaudRate > 0)
                 cboBaudRate.Text = lastBaudRate.ToString();
+
+            // 定时发送间隔：恢复上次设置
+            int timerInterval = Properties.Settings.Default.TimerSendInterval;
+            if (timerInterval > 0)
+                txtTimerInterval.Text = timerInterval.ToString();
+
+            // 编码：固定三项（UTF-8 / GBK / ASCII），恢复上次选择
+            cboEncoding.Items.Add("UTF-8");
+            cboEncoding.Items.Add("GBK");
+            cboEncoding.Items.Add("ASCII");
+            string lastEncoding = Properties.Settings.Default.Encoding;
+            if (string.IsNullOrEmpty(lastEncoding)) lastEncoding = "UTF-8";
+            cboEncoding.SelectedItem = lastEncoding;
 
             // 数据位
             cboDataBits.Items.Clear();
@@ -101,6 +139,11 @@ namespace SerialPort
             _timerPortCheck.Tick += TimerPortCheck_Tick;
             _timerPortCheck.Start();
 
+            // 数据统计：1 秒刷新一次（累计字节 / 速率 / 连接时长）
+            _timerStats.Interval = TimeSpan.FromSeconds(1);
+            _timerStats.Tick += TimerStats_Tick;
+            _timerStats.Start();
+
             // 订阅服务事件（服务在 UI 线程构造，事件回调已在 UI 线程，可直接操作控件）
             _service.DataReceived += OnDataReceived;
             _service.ConnectionChanged += OnConnectionChanged;
@@ -114,12 +157,19 @@ namespace SerialPort
             Closed += (s, e) =>
             {
                 _timerPortCheck.Stop();       // 停止端口轮询
-                _saveFileWriter?.Dispose();   // 关闭保存文件
+                _timerStats.Stop();           // 停止统计刷新
+                _timerSending = false;        // 停止定时发送（后台线程随进程退出）
+                DisposeSaveWriter();          // 关闭保存文件（排空队列后释放）
                 _service.Dispose();           // 关闭串口并释放资源（Dispose 幂等）
 
                 // 保存当前波特率与文件保存路径，下次启动自动恢复
                 if (int.TryParse(cboBaudRate.Text, out int baudRate) && baudRate > 0)
                     Properties.Settings.Default.LastBaudRate = baudRate;
+
+                if (int.TryParse(txtTimerInterval.Text.Trim(), out int savedTimerInterval) && savedTimerInterval > 0)
+                    Properties.Settings.Default.TimerSendInterval = savedTimerInterval;
+
+                Properties.Settings.Default.Encoding = cboEncoding.SelectedItem?.ToString() ?? "UTF-8";
 
                 string savePath = txtSavePath.Text?.Trim();
                 if (!string.IsNullOrWhiteSpace(savePath))
@@ -149,6 +199,7 @@ namespace SerialPort
                         {
                             _awaitingDevice = false;
                             _reconnectFailures = 0;
+                            ApplyPinStates();   // 重连重建了端口实例：按当前勾选重写引脚
                             UpdateStatus($"检测到 {_service.PortName} 已重新连接");
                         }
                         else if (++_reconnectFailures == 10)
@@ -306,7 +357,14 @@ namespace SerialPort
                 ? (Brush)FindResource("PortCloseBrush")
                 : (Brush)FindResource("PortOpenBrush");
             UpdateFileEditState(connected);   // 串口打开时禁止修改文件名
-            if (!connected)
+            chkDtr.IsEnabled = connected;     // 引脚开关连接后可用
+            chkRts.IsEnabled = connected;
+            if (connected)
+            {
+                _connectStartedAt = DateTime.Now;   // 连接时长计时起点
+                ApplyPinStates();                    // 按当前勾选写入引脚
+            }
+            else
             {
                 _awaitingDevice = false;   // 手动关闭等：解除冻结，恢复列表刷新
                 UpdateStatus("已断开");
@@ -320,6 +378,20 @@ namespace SerialPort
         {
             ThemeManager.Toggle();
             btnThemeToggle.Content = ThemeManager.Current == ThemeMode.Dark ? "浅色模式" : "深色模式";
+            // 主题持久化：保存选择，下次启动恢复
+            Properties.Settings.Default.Theme = (int)ThemeManager.Current;
+            Properties.Settings.Default.Save();
+        }
+
+        /// <summary>编码下拉切换：重建对应状态保持 Decoder（从干净状态开始），发送编码联动。</summary>
+        private void CboEncoding_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+        {
+            string name = cboEncoding.SelectedItem as string;
+            if (string.IsNullOrEmpty(name)) return;
+            _textEncoding = name == "GBK" ? Encoding.GetEncoding("GBK")
+                : name == "ASCII" ? Encoding.ASCII
+                : Encoding.UTF8;
+            _textDecoder = _textEncoding.GetDecoder();   // 新编码从干净状态开始
         }
 
         // ============================================================
@@ -329,9 +401,46 @@ namespace SerialPort
         {
             if (e.Data == null || e.Data.Length == 0) return;
 
+            // 帧解析窗口打开时：把原始字节副本喂给解析器（窗口关闭即停止，无常驻开销）
+            _frameWindow?.PushData(e.Data);
+
             _receivedBytesTotal += e.Data.Length;
 
             string increment = GetTimestampedText(GetIncrementText(e.Data));
+            AppendDisplayText(increment);
+        }
+
+        /// <summary>1 秒统计刷新：累计接收/发送字节、双向实时速率、连接时长（UI 线程定时器）。</summary>
+        private void TimerStats_Tick(object sender, EventArgs e)
+        {
+            long rx = _receivedBytesTotal;
+            long tx = _sentBytesTotal;
+            double rxKb = (rx - _lastStatsRx) / 1024.0;
+            double txKb = (tx - _lastStatsTx) / 1024.0;
+            _lastStatsRx = rx;
+            _lastStatsTx = tx;
+            string duration = _service.IsConnected
+                ? DateTime.Now.Subtract(_connectStartedAt).ToString(@"hh\:mm\:ss")
+                : "--:--:--";
+            txtStats.Text = $"累计收 {rx} B / 发 {tx} B　|　↓ {rxKb:F1} KB/s　↑ {txKb:F1} KB/s　|　连接 {duration}";
+        }
+
+        /// <summary>
+        /// 统一追加显示文本：筛选缓冲 / 容量截断 / 文件保存 / 自动滚动（接收数据与本地回显共用）。
+        /// 暂停显示时仅累积与写文件，不刷新接收区，恢复时一次性补齐。
+        /// </summary>
+        private void AppendDisplayText(string increment)
+        {
+            if (chkPauseReceive.IsChecked == true)
+            {
+                // 暂停：数据仍记入筛选缓冲与保存文件，仅不刷新接收区
+                if (_filterState != null) _filterState.Buffer.Append(increment);
+                _pausedBuffer.Append(increment);
+                TrimPausedBuffer();
+                TrimReceiveIfNeeded();   // 暂停期间筛选 Buffer 同样截头，防止长时间暂停内存无界
+                EnqueueSaveText(increment);
+                return;
+            }
 
             if (_filterState != null)
             {
@@ -343,16 +452,108 @@ namespace SerialPort
             {
                 // 增量追加（WPF 下全量重赋 Text 会重建整个文本，大数据量时卡顿）
                 txtReceive.AppendText(increment);
+                _receiveTextLength += increment.Length;
             }
 
-            // 勾选“文件保存”时把同样的内容写入文件
-            if (_saveFileWriter != null)
-                _saveFileWriter.Write(increment);
+            // 接收区与筛选缓冲容量上限：超限截头，防止长时运行内存无界增长
+            TrimReceiveIfNeeded();
+
+            // 勾选“文件保存”时把同样的内容写入文件（后台队列写盘，不阻塞 UI 线程）
+            EnqueueSaveText(increment);
 
             if (chkAutoScroll.IsChecked == true)
                 txtReceive.ScrollToEnd();
+        }
 
-            UpdateStatus($"累计接收 {_receivedBytesTotal} 字节");
+        /// <summary>暂停缓冲上限截头（与接收区同量级，防止长时间暂停内存无界增长）。</summary>
+        private void TrimPausedBuffer()
+        {
+            if (_pausedBuffer.Length > MaxReceiveChars + TrimKeepMargin)
+                _pausedBuffer.Remove(0, _pausedBuffer.Length - MaxReceiveChars);
+        }
+
+        /// <summary>暂停显示开关：勾选暂停刷新，取消时一次性补齐暂停期间的数据。</summary>
+        private void ChkPauseReceive_Changed(object sender, RoutedEventArgs e)
+        {
+            if (chkPauseReceive.IsChecked == true)
+            {
+                UpdateStatus("接收显示已暂停，数据继续接收中");
+                return;
+            }
+            ResumeDisplay();
+            UpdateStatus("已恢复接收显示");
+        }
+
+        /// <summary>恢复显示：把暂停期间累积的文本一次性追加（筛选模式按行过滤，Buffer 已记录不重复）。</summary>
+        private void ResumeDisplay()
+        {
+            if (_pausedBuffer.Length == 0) return;
+            string pending = _pausedBuffer.ToString();
+            _pausedBuffer.Clear();
+
+            if (_filterState != null)
+                AppendFiltered(pending);   // 逐行过滤追加显示（Buffer 在暂停期间已同步记录）
+            else
+            {
+                txtReceive.AppendText(pending);
+                _receiveTextLength += pending.Length;
+                TrimReceiveIfNeeded();
+            }
+            if (chkAutoScroll.IsChecked == true)
+                txtReceive.ScrollToEnd();
+        }
+
+        /// <summary>字节数组转 "AA BB CC" 形式（本地回显 hex 模式用）。</summary>
+        private static string FormatHex(byte[] bytes)
+        {
+            var sb = new StringBuilder(bytes.Length * 3);
+            foreach (byte b in bytes)
+                sb.Append(b.ToString("X2")).Append(' ');
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>本地回显：勾选后把发送内容以 [TX] 前缀追加到接收区（与接收数据同管线，含时间戳）。</summary>
+        private void AppendLocalEcho(string content)
+        {
+            if (chkLocalEcho.IsChecked != true) return;
+            // 行尾去掉追加的换行再补 \r\n：回显内容自成一行；经 GetTimestampedText 保持行首状态机一致
+            AppendDisplayText(GetTimestampedText("[TX] " + content.TrimEnd('\r', '\n') + "\r\n"));
+        }
+
+        /// <summary>
+        /// 接收显示与筛选缓冲的容量上限（字符数）：超出后截掉头部等量内容。
+        /// WPF TextBox 整段存储文本且 AppendText 随文本增长越来越慢，必须设上限防止内存无界增长。
+        /// </summary>
+        private const int MaxReceiveChars = 1_000_000;
+
+        /// <summary>截断余量：计数超过“上限 + 余量”才截头，避免高频接收时每块都触发全量拷贝。</summary>
+        private const int TrimKeepMargin = 200_000;
+
+        /// <summary>接收区（及筛选 Buffer）超过容量上限时截头，保持内存有界。</summary>
+        private void TrimReceiveIfNeeded()
+        {
+            // 筛选模式：Buffer 记录全量文本，增长快于显示（不匹配行不进显示），须独立检查截头
+            if (_filterState != null)
+            {
+                int bufferLength = _filterState.Buffer.Length;
+                if (bufferLength > MaxReceiveChars + TrimKeepMargin)
+                    _filterState.Buffer.Remove(0, bufferLength - MaxReceiveChars);
+            }
+
+            if (_receiveTextLength <= MaxReceiveChars + TrimKeepMargin) return;
+
+            // 只在截断时读一次实际长度（频率低），防御计数漂移
+            int actualLength = txtReceive.Text.Length;
+            if (actualLength <= MaxReceiveChars)
+            {
+                _receiveTextLength = actualLength;   // 计数漂移：校准
+                return;
+            }
+
+            int remove = actualLength - MaxReceiveChars;
+            txtReceive.Text = txtReceive.Text.Substring(remove);   // 截头：保留最新数据
+            _receiveTextLength = actualLength - remove;
+            _searchIndex = _searchIndex < 0 ? -1 : Math.Max(-1, _searchIndex - remove);   // 搜索下标随截断前移
         }
 
         /// <summary>计算本次接收数据对应的显示文本（hex 模式每字节 "XX " 加换行，文本模式为 UTF-8 解码结果）。</summary>
@@ -360,13 +561,18 @@ namespace SerialPort
         {
             if (chkReceiveHex.IsChecked == true)
             {
+                _textDecoder.Reset();   // 切到 hex 模式：丢弃文本模式残留的未完成多字节序列
                 StringBuilder sb = new StringBuilder(data.Length * 3 + 2);
                 foreach (byte b in data)
                     sb.Append(b.ToString("X2")).Append(' ');
                 sb.AppendLine();
                 return sb.ToString();
             }
-            return Encoding.UTF8.GetString(data);
+            // 状态保持的 Decoder 跨块解码：多字节序列被拆到相邻块时不会产生 U+FFFD 乱码
+            int charCount = _textDecoder.GetCharCount(data, 0, data.Length);
+            char[] chars = new char[charCount];
+            _textDecoder.GetChars(data, 0, data.Length, chars, 0);
+            return new string(chars);
         }
 
         /// <summary>
@@ -376,10 +582,12 @@ namespace SerialPort
         /// </summary>
         private string GetTimestampedText(string increment)
         {
-            // 未勾选时无需构造输出：只跟踪行首位置（复用 NewLineChars 快速扫描），直接返回原文
+            // 未勾选时无需构造输出：行首状态只取决于块尾字符（块中间的换行不影响块尾是否处于行首），
+            // 空块保持原状态，直接返回原文
             if (chkTimestamp.IsChecked != true)
             {
-                if (increment.IndexOfAny(NewLineChars) >= 0) _atLineStart = true;
+                if (increment.Length > 0)
+                    _atLineStart = IsNewLineChar(increment[increment.Length - 1]);
                 return increment;
             }
 
@@ -410,8 +618,16 @@ namespace SerialPort
                 MessageBox.Show("串口未连接，无法发送。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
-            string text = txtSend.Text;
-            if (string.IsNullOrEmpty(text)) return;
+            SendText(txtSend.Text);
+        }
+
+        /// <summary>
+        /// 发送界面文本：按当前模式（hex/文本、追加换行、编码）解析并发送，累计发送字节统计。
+        /// 发送按钮、定时发送、快捷指令共用此入口；hex 解析失败时弹窗提示并返回 false。
+        /// </summary>
+        internal bool SendText(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
 
             try
             {
@@ -422,28 +638,142 @@ namespace SerialPort
                 {
                     byte[] bytes = HexStringToBytes(text);
                     _service.SendBytes(bytes);
+                    _sentBytesTotal += bytes.Length;
+                    AppendLocalEcho(FormatHex(bytes));
                 }
                 else
                 {
-                    _service.SendText(text, Encoding.UTF8);
+                    _service.SendText(text, _textEncoding);
+                    _sentBytesTotal += _textEncoding.GetByteCount(text);
+                    AppendLocalEcho(text);
                 }
+                return true;
             }
             catch (Exception ex)
             {
                 // 设备拔出等待重连期间的发送已在服务层静默丢弃，这里只报告其余错误
                 MessageBox.Show($"发送失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                return false;
             }
         }
 
         private void BtnClearSend_Click(object sender, RoutedEventArgs e) => txtSend.Clear();
 
+        /// <summary>打开快捷指令窗口（非模态：发送指令时不阻塞主窗口操作）。</summary>
+        private void BtnQuickCommands_Click(object sender, RoutedEventArgs e)
+        {
+            var wnd = new QuickCommandWindow(this);
+            wnd.Show();
+        }
+
+        // ============================================================
+        // RTS / DTR 引脚控制（连接后启用，重连后按勾选重写）
+        // ============================================================
+        private void ChkPin_Changed(object sender, RoutedEventArgs e)
+        {
+            if (!_service.IsConnected) return;   // 未连接时勾选仅作预设
+            ApplyPinStates();
+        }
+
+        /// <summary>把当前勾选的引脚状态写入端口（手动连接 / 自动重连后端口实例重建，需重新应用）。</summary>
+        private void ApplyPinStates()
+        {
+            _service.SetDtr(chkDtr.IsChecked == true);
+            _service.SetRts(chkRts.IsChecked == true);
+        }
+
+        // ============================================================
+        // 定时发送（后台线程按间隔循环发送发送框内容）
+        // ============================================================
+        private void BtnTimerSend_Click(object sender, RoutedEventArgs e)
+        {
+            if (_timerSending)
+            {
+                _timerSending = false;
+                _timerGen++;   // 代次递增：旧线程（可能在 Sleep 中）醒来后立即退出
+                btnTimerSend.Content = "定时发送";
+                UpdateStatus("已停止定时发送");
+                return;
+            }
+            if (!_service.IsConnected)
+            {
+                MessageBox.Show("串口未连接，无法定时发送。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+            if (!int.TryParse(txtTimerInterval.Text.Trim(), out int interval) || interval <= 0)
+            {
+                MessageBox.Show("定时发送间隔必须是正整数（毫秒）。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            _timerSending = true;
+            int gen = ++_timerGen;
+            btnTimerSend.Content = "停止定时";
+            UpdateStatus($"定时发送已启动：每 {interval} ms");
+            var thread = new Thread(() => TimerSendLoop(interval, gen)) { IsBackground = true };
+            thread.Start();
+        }
+
+        /// <summary>
+        /// 定时发送循环：每次经 Dispatcher.Invoke 回 UI 线程取发送框内容并发送（控件只能 UI 线程访问），
+        /// 间隔 = 发送耗时 + Sleep(interval)，后台线程不触碰任何控件。
+        /// 代次（gen）守卫：停止后立即重启不会产生双线程并发发送；发送失败（hex 格式错误等）即停止。
+        /// </summary>
+        private void TimerSendLoop(int interval, int gen)
+        {
+            try
+            {
+                while (_timerSending && gen == _timerGen)
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        // 停止标志在 Invoke 排队期间可能已被置位：再查一次，避免停止后仍发送一轮
+                        if (!_timerSending || gen != _timerGen || !_service.IsConnected) return;
+                        if (!SendText(txtSend.Text))
+                        {
+                            // 发送失败（如发送框被改成非法 hex）：停止定时，避免按间隔无限弹窗
+                            _timerSending = false;
+                            _timerGen++;
+                            btnTimerSend.Content = "定时发送";
+                        }
+                    });
+                    Thread.Sleep(interval);
+                }
+            }
+            catch
+            {
+                // 窗口关闭 / 应用退出时 Invoke 可能抛异常：静默退出（后台线程不留下未处理异常）
+            }
+        }
+
+        /// <summary>打开帧解析窗口（单实例，重复点击激活；关闭后引用置空，再次点击重建）。</summary>
+        private void BtnFrameParser_Click(object sender, RoutedEventArgs e)
+        {
+            if (_frameWindow == null)
+            {
+                _frameWindow = new FrameParserWindow();
+                _frameWindow.Closed += (s, args) => _frameWindow = null;
+            }
+            if (_frameWindow.IsVisible)
+            {
+                _frameWindow.Activate();
+                return;
+            }
+            _frameWindow.Show();
+        }
+
         private void BtnClearReceive_Click(object sender, RoutedEventArgs e)
         {
             _receivedBytesTotal = 0;
+            _lastStatsRx = 0;   // 速率快照同步复位，避免清空后速率虚高
+            _textDecoder.Reset();   // 视觉清空后解码状态同步复位，避免新数据开头残留乱码
+            _atLineStart = true;    // 清空后回到行首状态：新数据首行应补时间戳
+            _pausedBuffer.Clear();  // 暂停缓冲一并清空，恢复时不再显示旧数据
             // 同时复位搜索 / 筛选状态，保证清空后显示一致
             _searchIndex = -1;
             _filterState = null;
             txtReceive.Clear();
+            _receiveTextLength = 0;
             UpdateStatus("已清空接收区");
         }
 
@@ -533,6 +863,7 @@ namespace SerialPort
         {
             if (_filterState == null) return;
             txtReceive.Text = _filterState.Buffer.ToString();
+            _receiveTextLength = txtReceive.Text.Length;
             _filterState = null;
             if (chkAutoScroll.IsChecked == true) txtReceive.ScrollToEnd();
             UpdateStatus("已清除筛选");
@@ -542,6 +873,7 @@ namespace SerialPort
         private void RebuildFilteredView()
         {
             txtReceive.Clear();
+            _receiveTextLength = 0;
             if (_filterState == null) return;
             foreach (string line in SplitLines(_filterState.Buffer.ToString()))
                 AppendLineIfMatches(line);
@@ -572,6 +904,7 @@ namespace SerialPort
             {
                 txtReceive.AppendText(line);
                 txtReceive.AppendText("\r\n");
+                _receiveTextLength += line.Length + 2;
             }
         }
 
@@ -649,12 +982,8 @@ namespace SerialPort
                 StartSaveFile();
                 return;
             }
-            // 取消勾选：关闭当前保存文件
-            if (_saveFileWriter != null)
-            {
-                _saveFileWriter.Dispose();
-                _saveFileWriter = null;
-            }
+            // 取消勾选：关闭当前保存文件（排空队列后释放）
+            DisposeSaveWriter();
             txtSaveFileName.Text = string.Empty;
             UpdateFileEditState(_service.IsConnected);
         }
@@ -671,17 +1000,18 @@ namespace SerialPort
             string name = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".txt";
             try
             {
-                _saveFileWriter = new StreamWriter(Path.Combine(dir, name), true, new UTF8Encoding(false))
+                var writer = new StreamWriter(Path.Combine(dir, name), true, new UTF8Encoding(false))
                 {
-                    AutoFlush = true
+                    AutoFlush = false   // 由后台写队列批量写盘，避免高频 flush 阻塞 UI
                 };
+                lock (_saveLock) _saveFileWriter = writer;   // 与后台写线程同步可见
                 _saveFilePath = Path.Combine(dir, name);
                 txtSaveFileName.Text = name;
                 UpdateStatus($"开始保存到 {_saveFilePath}");
             }
             catch (Exception ex)
             {
-                _saveFileWriter = null;
+                lock (_saveLock) _saveFileWriter = null;
                 chkSaveFile.IsChecked = false;   // 创建失败则取消勾选，保持状态一致
                 MessageBox.Show($"创建保存文件失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
             }
@@ -696,14 +1026,14 @@ namespace SerialPort
                 Description = "选择文件保存路径",
                 SelectedPath = txtSavePath.Text.Trim()
             };
-            if (dlg.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
+            // 指定主窗口为所有者，避免对话框跑到主窗口后面
+            if (dlg.ShowDialog(new Win32Window(new WindowInteropHelper(this).Handle)) != System.Windows.Forms.DialogResult.OK) return;
 
             txtSavePath.Text = dlg.SelectedPath;
             // 保存已开启时路径变更：关闭旧文件，以新路径重新生成默认文件名文件
-            if (chkSaveFile.IsChecked == true && _saveFileWriter != null)
+            if (chkSaveFile.IsChecked == true)
             {
-                _saveFileWriter.Dispose();
-                _saveFileWriter = null;
+                DisposeSaveWriter();
                 StartSaveFile();
             }
         }
@@ -716,7 +1046,7 @@ namespace SerialPort
                 MessageBox.Show("串口已连接，无法修改文件名。请先关闭串口。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
-            if (_saveFileWriter == null) return;   // 未勾选文件保存，无文件可改名
+            lock (_saveLock) { if (_saveFileWriter == null) return; }   // 未勾选文件保存，无文件可改名
 
             string name = txtSaveFileName.Text.Trim();
             if (string.IsNullOrEmpty(name))
@@ -760,6 +1090,84 @@ namespace SerialPort
             btnModifyFileName.IsEnabled = saveChecked && !connected;
         }
 
+        /// <summary>把接收文本加入后台写盘队列（写盘不阻塞 UI 线程；队列空则启动排空任务）。</summary>
+        private void EnqueueSaveText(string text)
+        {
+            lock (_saveLock)
+            {
+                if (_saveFileWriter == null) return;   // 未开启文件保存
+                _saveQueue.Enqueue(text);
+                if (_saveDraining) return;
+                _saveDraining = true;
+            }
+            Task.Run(() => DrainSaveQueue());
+        }
+
+        /// <summary>
+        /// 后台排空保存队列：串行写入 StreamWriter，队列空时刷盘并退出。
+        /// AutoFlush 已关闭，由本循环控制写盘时机，高频数据下显著降低 flush 开销。
+        /// 写盘失败（磁盘满等）：释放 writer 并在 UI 线程复位勾选，避免队列永久停摆。
+        /// </summary>
+        private void DrainSaveQueue()
+        {
+            while (true)
+            {
+                string text;
+                lock (_saveLock)
+                {
+                    if (_saveQueue.Count == 0)
+                    {
+                        try { _saveFileWriter?.Flush(); } catch { }   // 刷盘失败不阻塞：下次 Enqueue 重新排空
+                        _saveDraining = false;
+                        return;
+                    }
+                    text = _saveQueue.Dequeue();
+                    if (_saveFileWriter != null)
+                    {
+                        try
+                        {
+                            _saveFileWriter.Write(text);
+                        }
+                        catch
+                        {
+                            // 写盘失败（磁盘满等）：放弃剩余数据、释放 writer，UI 复位保存勾选
+                            _saveQueue.Clear();
+                            try { _saveFileWriter.Dispose(); } catch { }
+                            _saveFileWriter = null;
+                            _saveDraining = false;
+                            // 窗口关闭的窄竞态下 BeginInvoke 可能抛异常：包住，不影响后台线程退出
+                            try
+                            {
+                                Dispatcher.BeginInvoke(new Action(() =>
+                                {
+                                    chkSaveFile.IsChecked = false;
+                                    UpdateStatus("文件保存失败（磁盘错误），已停止保存");
+                                }));
+                            }
+                            catch { }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>关闭并释放保存文件流（线程安全：锁内排空队列后释放，取消勾选不丢已接收数据）。</summary>
+        private void DisposeSaveWriter()
+        {
+            lock (_saveLock)
+            {
+                // 把队列中剩余数据写完再关闭，避免取消勾选/关窗瞬间丢失已接收数据
+                while (_saveQueue.Count > 0 && _saveFileWriter != null)
+                {
+                    try { _saveFileWriter.Write(_saveQueue.Dequeue()); }
+                    catch { _saveQueue.Clear(); break; }   // 写盘失败：放弃剩余数据
+                }
+                try { _saveFileWriter?.Dispose(); } catch { }
+                _saveFileWriter = null;
+            }
+        }
+
         // ============================================================
         // 软件更新（状态栏“检查更新”入口；启动时自动检查一次）
         // ============================================================
@@ -775,8 +1183,15 @@ namespace SerialPort
             if (result.IsUpdateAvailable)
             {
                 UpdateStatus($"发现新版本 v{result.LatestVersion}");
-                var dlg = new UpdateDialog(_updateService, result);
-                dlg.ShowDialog();
+                if (_manualCheck)
+                {
+                    // 手动检查：弹窗升级。检查流程到此结束，立即复位标志——后续下载错误由
+                    // UpdateDialog 展示（UpdateError 为多订阅事件，不复位会叠加双弹窗）
+                    _manualCheck = false;
+                    var dlg = new UpdateDialog(_updateService, result);
+                    dlg.ShowDialog();
+                }
+                // 自动检查（如启动时）：仅状态栏提示，不打断用户，点“检查更新”再弹升级窗口
             }
             else
             {
@@ -872,5 +1287,12 @@ namespace SerialPort
                 bytes[i] = Convert.ToByte(cleaned.Substring(i * 2, 2), 16);
             return bytes;
         }
+    }
+
+    /// <summary>IWin32Window 包装：给 WinForms 对话框提供 WPF 窗口句柄作为所有者。</summary>
+    internal sealed class Win32Window : System.Windows.Forms.IWin32Window
+    {
+        public Win32Window(IntPtr handle) { Handle = handle; }
+        public IntPtr Handle { get; }
     }
 }

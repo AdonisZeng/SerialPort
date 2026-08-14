@@ -34,7 +34,8 @@ namespace SerialPort.Services
         private static readonly TimeSpan CacheMaxAge = TimeSpan.FromHours(12);
 
         private readonly SynchronizationContext _syncContext;
-        private bool _checking;   // 检查中标志，避免重复触发
+        // 检查中标志（0 = 空闲，1 = 检查中）：UI 线程置位、后台线程复位，用 Interlocked 保证跨线程可见性
+        private int _checking;
 
         /// <summary>版本检查完成时触发（已在 UI 线程回调），携带检查结果。</summary>
         public event EventHandler<UpdateCheckResult> CheckCompleted;
@@ -63,8 +64,13 @@ namespace SerialPort.Services
         /// </summary>
         public void CheckForUpdatesAsync(bool notifyWhenUpToDate = false, bool forceRefresh = false)
         {
-            if (_checking) return;
-            _checking = true;
+            if (Interlocked.CompareExchange(ref _checking, 1, 0) != 0)
+            {
+                // 已在检查中：自动检查静默忽略，手动检查给出提示（避免状态栏停在"正在检查…"永不结束）
+                if (forceRefresh)
+                    Post(() => UpdateError?.Invoke(this, "正在检查更新，请稍后再试。"));
+                return;
+            }
 
             Task.Run(() =>
             {
@@ -96,7 +102,7 @@ namespace SerialPort.Services
                 }
                 finally
                 {
-                    _checking = false;
+                    Interlocked.Exchange(ref _checking, 0);
                 }
             });
         }
@@ -104,11 +110,13 @@ namespace SerialPort.Services
         /// <summary>
         /// 下载并应用更新（下载 → SHA256 校验 → 替换 → 启动新版本 → 触发 UpdateApplied 退出）。
         /// 任何失败都会回滚并抛出，通过 UpdateError 报告，不影响当前程序运行。
+        /// token 由调用方（UpdateDialog）提供：更新窗口关闭即取消，替换程序前做最后一次确认。
         /// </summary>
-        public void DownloadAndApplyAsync(UpdateCheckResult result)
+        public void DownloadAndApplyAsync(UpdateCheckResult result, CancellationToken token = default)
         {
             Task.Run(async () =>
             {
+                string newExe = null;   // 下载目标路径：取消时清理残留
                 try
                 {
                     string workDir = Path.Combine(Path.GetTempPath(), "SerialPortUpdate");
@@ -116,19 +124,40 @@ namespace SerialPort.Services
 
                     string exePath = Assembly.GetExecutingAssembly().Location;
                     string exeName = Path.GetFileName(exePath);
-                    string newExe = Path.Combine(workDir, exeName);
+                    newExe = Path.Combine(workDir, exeName);
 
-                    // 1. 下载新程序与 SHA256 校验文件（带进度报告）
+                    // 1. 下载新程序与 SHA256 校验文件（带进度报告，支持取消）
                     Post(() => UpdateProgress?.Invoke(this, 0));
-                    await DownloadFileAsync(result.ExeUrl, newExe).ConfigureAwait(false);
-                    if (!string.IsNullOrEmpty(result.Sha256Url))
+                    await DownloadFileAsync(result.ExeUrl, newExe, token).ConfigureAwait(false);
+                    if (string.IsNullOrEmpty(result.Sha256Url))
+                        throw new IOException("Release 附件中缺少 SHA256 校验文件，为安全起见已取消更新。");
+                    string hashFile = Path.Combine(workDir, exeName + ".sha256");
+                    await DownloadFileAsync(result.Sha256Url, hashFile, token).ConfigureAwait(false);
+                    VerifySha256(newExe, hashFile);
+
+                    // 2. 尽力下载配置文件（发布包含 config 时）；失败不阻断升级。
+                    //    必须在替换 exe 之前完成：替换之后不再有任何可取消的等待点，保证“取消即不替换”
+                    string newConfig = null;
+                    if (!string.IsNullOrEmpty(result.ConfigUrl))
                     {
-                        string hashFile = Path.Combine(workDir, exeName + ".sha256");
-                        await DownloadFileAsync(result.Sha256Url, hashFile).ConfigureAwait(false);
-                        VerifySha256(newExe, hashFile);
+                        try
+                        {
+                            newConfig = Path.Combine(workDir, exeName + ".config");
+                            await DownloadFileAsync(result.ConfigUrl, newConfig, token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;   // 取消不能被吞掉：否则会继续替换并强制退出
+                        }
+                        catch
+                        {
+                            newConfig = null;   // 配置文件下载失败可忽略（不影响程序本体运行）
+                        }
                     }
 
-                    // 2. 替换运行中的 exe（Windows 允许重命名运行中的映像，故可先改名再移入新文件）
+                    // 3. 替换运行中的 exe（Windows 允许重命名运行中的映像，故可先改名再移入新文件）。
+                    //    替换前最后一次确认取消状态：窗口已关闭则中止，绝不静默替换程序并退出应用。
+                    token.ThrowIfCancellationRequested();
                     string oldExe = exePath + ".old";
                     try
                     {
@@ -149,24 +178,25 @@ namespace SerialPort.Services
                         throw new IOException("替换程序文件失败：" + ex.Message, ex);
                     }
 
-                    // 3. 尽力替换配置文件（发布包含 config 时）；失败不阻断升级
-                    if (!string.IsNullOrEmpty(result.ConfigUrl))
+                    // 4. 替换配置文件（同步快速，失败忽略）；此后仅剩启动新版本，无等待点
+                    if (newConfig != null)
                     {
-                        try
-                        {
-                            string newConfig = Path.Combine(workDir, exeName + ".config");
-                            await DownloadFileAsync(result.ConfigUrl, newConfig).ConfigureAwait(false);
-                            File.Copy(newConfig, exePath + ".config", true);
-                        }
-                        catch
-                        {
-                            // 配置文件替换失败可忽略（不影响程序本体运行）
-                        }
+                        try { File.Copy(newConfig, exePath + ".config", true); } catch { }
                     }
 
-                    // 4. 启动新版本，退出当前进程
+                    // 5. 启动新版本，退出当前进程
                     Process.Start(exePath);
                     Post(() => UpdateApplied?.Invoke(this, EventArgs.Empty));
+                }
+                catch (OperationCanceledException)
+                {
+                    // 用户取消（更新窗口已关闭）：清理整个临时目录，仅提示不报错
+                    if (newExe != null)
+                    {
+                        string dir = Path.GetDirectoryName(newExe);
+                        try { Directory.Delete(dir, true); } catch { }
+                    }
+                    Post(() => UpdateError?.Invoke(this, "更新已取消。"));
                 }
                 catch (Exception ex)
                 {
@@ -269,6 +299,8 @@ namespace SerialPort.Services
                         // 校验文件或程序附件缺失时给出明确提示
                         if (string.IsNullOrEmpty(result.ExeUrl))
                             throw new IOException("Release 附件中找不到 " + exeName + "，发布不完整。");
+                        if (string.IsNullOrEmpty(result.Sha256Url))
+                            throw new IOException("Release 附件中找不到 " + exeName + ".sha256 校验文件，发布不完整。");
                     }
                 }
             }
@@ -343,7 +375,7 @@ namespace SerialPort.Services
         }
 
         /// <summary>下载文件到目标路径，期间按已读字节数报告进度。</summary>
-        private async Task DownloadFileAsync(string url, string destPath)
+        private async Task DownloadFileAsync(string url, string destPath, CancellationToken token)
         {
             using (var client = new HttpClient())
             {
@@ -358,9 +390,9 @@ namespace SerialPort.Services
                         var buffer = new byte[81920];
                         long done = 0;
                         int read;
-                        while ((read = await input.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
+                        while ((read = await input.ReadAsync(buffer, 0, buffer.Length, token).ConfigureAwait(false)) > 0)
                         {
-                            await output.WriteAsync(buffer, 0, read).ConfigureAwait(false);
+                            await output.WriteAsync(buffer, 0, read, token).ConfigureAwait(false);
                             done += read;
                             ReportProgress(done, total);
                         }

@@ -22,6 +22,17 @@ namespace SerialPort.Services
         private readonly SynchronizationContext _syncContext;
         private bool _disposed;
 
+        // 保护 _port 的跨线程读写（后台接收回调 vs UI 线程重建/关闭）
+        private readonly object _portLock = new object();
+
+        // 接收攒批：后台线程累积数据合并成块，一次 Post 到 UI，降低高频数据下的 UI 积压
+        private readonly object _pendingLock = new object();
+        private MemoryStream _pendingData;         // 未提交的接收数据（非空 = 已有在途 Post 将取走）
+        private SerialPortType _pendingPort;       // 数据所属端口实例（Post 后用于实例守卫）
+
+        /// <summary>攒批提交上限：超过后强制提交，防止 UI 长时间不投递时后台内存无界增长。</summary>
+        private const int PendingBatchMaxBytes = 64 * 1024;
+
         /// <summary>当接收到数据时触发（已在 UI 线程上回调）。</summary>
         public event EventHandler<DataReceivedEventArgs> DataReceived;
 
@@ -61,8 +72,12 @@ namespace SerialPort.Services
         /// <summary>销毁当前端口实例（摘事件、关闭、释放）并清空字段；任何异常都吞掉。</summary>
         private void DisposePort()
         {
-            SerialPortType old = _port;
-            _port = null;   // 先清字段：在途 DataReceived 回调的实例守卫立即生效
+            SerialPortType old;
+            lock (_portLock)
+            {
+                old = _port;
+                _port = null;   // 先清字段：在途 DataReceived 回调的实例守卫立即生效
+            }
             if (old == null) return;
             old.DataReceived -= OnSerialDataReceived;
             try { if (old.IsOpen) old.Close(); } catch { }
@@ -83,7 +98,7 @@ namespace SerialPort.Services
                 RtsEnable = false
             };
             port.DataReceived += OnSerialDataReceived;
-            _port = port;
+            lock (_portLock) _port = port;
             return port;
         }
 
@@ -197,10 +212,22 @@ namespace SerialPort.Services
             }
         }
 
-        /// <summary>清空输入缓冲区（仅物理打开时有效）。</summary>
+        /// <summary>真正丢弃输入缓冲区中尚未读取的数据（仅物理打开时有效）。</summary>
         public void DiscardInBuffer()
         {
-            if (_port != null && _port.IsOpen) _port.BaseStream.Flush();
+            if (_port != null && _port.IsOpen) _port.DiscardInBuffer();
+        }
+
+        /// <summary>设置 DTR 引脚状态（仅物理打开时生效；未打开静默忽略，重连后由端口默认值接管）。</summary>
+        public void SetDtr(bool enable)
+        {
+            if (_port != null && _port.IsOpen) _port.DtrEnable = enable;
+        }
+
+        /// <summary>设置 RTS 引脚状态（仅物理打开时生效；未打开静默忽略，重连后由端口默认值接管）。</summary>
+        public void SetRts(bool enable)
+        {
+            if (_port != null && _port.IsOpen) _port.RtsEnable = enable;
         }
 
         private void OnSerialDataReceived(object sender, SerialDataReceivedEventArgs e)
@@ -208,7 +235,8 @@ namespace SerialPort.Services
             try
             {
                 // 只处理当前实例的事件：端口重建期间，旧实例的在途回调直接丢弃
-                SerialPortType port = _port;
+                SerialPortType port;
+                lock (_portLock) port = _port;
                 if (port == null || !ReferenceEquals(sender, port) || !port.IsOpen) return;
                 int bytes = port.BytesToRead;
                 if (bytes <= 0) return;
@@ -216,13 +244,22 @@ namespace SerialPort.Services
                 byte[] buffer = new byte[bytes];
                 port.BaseStream.Read(buffer, 0, bytes);
 
-                // 切回 UI 线程；期间端口若已重建，丢弃这批旧数据
-                SerialPortType snapshot = port;
-                Post(() =>
+                // 攒批：已有同实例的在途批则只追加数据（由该批的 Flush 统一提交），否则开新批并 Post
+                bool postFlush = false;
+                lock (_pendingLock)
                 {
-                    if (!ReferenceEquals(_port, snapshot)) return;
-                    DataReceived?.Invoke(this, new DataReceivedEventArgs(buffer));
-                });
+                    if (_pendingData == null || !ReferenceEquals(_pendingPort, port))
+                    {
+                        // 开始新批（不同实例的旧批由 Flush 时的实例守卫丢弃）
+                        _pendingData = new MemoryStream();
+                        _pendingPort = port;
+                        postFlush = true;
+                    }
+                    _pendingData.Write(buffer, 0, buffer.Length);
+                    // 超过攒批上限：强制提交（在途 Flush 会取走整批，本次新 Post 的 Flush 为空返回）
+                    if (_pendingData.Length > PendingBatchMaxBytes) postFlush = true;
+                }
+                if (postFlush) Post(FlushPendingData);
             }
             catch (Exception ex)
             {
@@ -232,14 +269,37 @@ namespace SerialPort.Services
             }
         }
 
+        /// <summary>UI 线程：提交攒批的接收数据；期间端口若已重建，丢弃这批旧数据。</summary>
+        private void FlushPendingData()
+        {
+            byte[] data;
+            SerialPortType port;
+            lock (_pendingLock)
+            {
+                if (_pendingData == null) return;
+                data = _pendingData.ToArray();
+                port = _pendingPort;
+                _pendingData = null;    // 移交后置空：后续新块开新批
+                _pendingPort = null;
+            }
+            bool isCurrent;
+            lock (_portLock) isCurrent = ReferenceEquals(_port, port);
+            if (!isCurrent) return;
+            DataReceived?.Invoke(this, new DataReceivedEventArgs(data));
+        }
+
         /// <summary>
-        /// 统一判定"设备已不可用"（拔出但端口名未消失等）：逻辑连接期间遇 IO 类异常时
-        /// 视为设备已拔出，静默丢弃本次收发，由 UI 定时器检测拔出并自动重连。返回是否已按此处理。
+        /// 统一判定"设备已不可用"（拔出但端口名未消失等）：逻辑连接期间遇 IO 类异常、
+        /// 端口关闭/重建竞态异常或读写超时时，视为设备已不可用，静默丢弃本次收发，
+        /// 由 UI 定时器检测拔出并自动重连。返回是否已按此处理。
         /// 注意：不能用 _port.IsOpen 判定——致命 IO 错误后 SerialStream 已被自动关闭，
         /// 以 IsOpen 判定会漏报（这正是旧版拔出后界面状态不更新的根源）。
         /// </summary>
         private bool HandleDeviceError(Exception ex) =>
-            _config != null && (ex is IOException || ex is UnauthorizedAccessException);
+            _config != null && (ex is IOException
+                || ex is UnauthorizedAccessException
+                || ex is InvalidOperationException    // 端口正在被关闭/重建（流已释放）时的写竞态
+                || ex is TimeoutException);           // 设备无响应：读/写超时
 
         /// <summary>把动作切回 UI 线程执行（后台线程事件回调统一走此入口）。</summary>
         private void Post(Action action) => _syncContext.Post(_ => action(), null);

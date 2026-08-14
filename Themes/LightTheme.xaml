@@ -12,4 +12,6 @@
     <SolidColorBrush x:Key="SecondaryBtnBackBrush" Color="#FAFBFE" />
     <SolidColorBrush x:Key="SecondaryBtnForeBrush" Color="#1E212C" />
     <SolidColorBrush x:Key="SecondaryBtnBorderBrush" Color="#A0A5B4" />
+    <!-- 下拉框悬停/展开背景（浅色主题专用色，替代 SystemColors.Highlight） -->
+    <SolidColorBrush x:Key="ComboHoverBackBrush" Color="#E9EDF5" />
 </ResourceDictionary>

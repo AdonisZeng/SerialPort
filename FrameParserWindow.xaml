@@ -1,0 +1,70 @@
+<Window x:Class="SerialPort.FrameParserWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="协议帧解析" Width="780" Height="500" MinWidth="600" MinHeight="380"
+        WindowStartupLocation="CenterOwner"
+        FontFamily="Segoe UI" FontSize="12"
+        Background="{DynamicResource PanelBackBrush}"
+        ShowInTaskbar="False">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <!-- 配置区 -->
+            <RowDefinition Height="*" />
+            <!-- 帧列表 -->
+            <RowDefinition Height="Auto" />
+            <!-- 底部按钮行 -->
+        </Grid.RowDefinitions>
+
+        <!-- 配置区 -->
+        <Grid Grid.Row="0" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="64" />
+                <ColumnDefinition Width="120" />
+                <ColumnDefinition Width="64" />
+                <ColumnDefinition Width="120" />
+                <ColumnDefinition Width="48" />
+                <ColumnDefinition Width="120" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Label Content="帧头(hex)" Padding="0" VerticalAlignment="Center" />
+            <TextBox x:Name="txtHeader" Grid.Column="1" Height="24" VerticalContentAlignment="Center"
+                     ToolTip="帧头字节（hex，空格分隔，如 AA 55）；可留空" />
+            <Label Grid.Column="2" Content="帧尾(hex)" Padding="0" VerticalAlignment="Center" Margin="8,0,0,0" />
+            <TextBox x:Name="txtFooter" Grid.Column="3" Height="24" VerticalContentAlignment="Center"
+                     ToolTip="帧尾字节（hex，空格分隔，如 0D 0A）；可留空。若长度等于校验输出长度则视为预期校验值" />
+            <Label Grid.Column="4" Content="校验" Padding="0" VerticalAlignment="Center" Margin="8,0,0,0" />
+            <ComboBox x:Name="cboChecksum" Grid.Column="5" Height="24" VerticalContentAlignment="Center"
+                      Template="{StaticResource ComboBoxTemplate}" />
+            <Button x:Name="btnApply" Grid.Column="6" Content="应用配置" Click="BtnApply_Click"
+                    Style="{StaticResource SecondaryButtonStyle}" Width="80" Height="26" Margin="8,0,0,0" />
+        </Grid>
+
+        <!-- 帧列表 -->
+        <ListView x:Name="lstFrames" Grid.Row="1" Background="{DynamicResource InputBackBrush}"
+                  Foreground="{DynamicResource InputForeBrush}"
+                  BorderBrush="{DynamicResource SecondaryBtnBorderBrush}"
+                  FontFamily="Consolas" FontSize="10pt">
+            <ListView.View>
+                <GridView>
+                    <GridViewColumn Header="时间" Width="86" DisplayMemberBinding="{Binding Time}" />
+                    <GridViewColumn Header="数据 (hex)" Width="360" DisplayMemberBinding="{Binding Hex}" />
+                    <GridViewColumn Header="ASCII" Width="140" DisplayMemberBinding="{Binding Ascii}" />
+                    <GridViewColumn Header="校验" Width="130" DisplayMemberBinding="{Binding Checksum}" />
+                </GridView>
+            </ListView.View>
+        </ListView>
+
+        <!-- 底部按钮行 -->
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,8,0,0">
+            <CheckBox x:Name="chkPause" Content="暂停解析" VerticalAlignment="Center" Margin="0,0,12,0"
+                      ToolTip="暂停后数据不再解析，恢复后从最新数据继续" />
+            <Button x:Name="btnClear" Content="清空列表" Click="BtnClear_Click"
+                    Style="{StaticResource SecondaryButtonStyle}" Width="80" Height="26" Margin="0,0,8,0" />
+            <Button x:Name="btnClose" Content="关闭" Click="BtnClose_Click"
+                    Style="{StaticResource SecondaryButtonStyle}" Width="60" Height="26" />
+            <TextBlock x:Name="txtStatus" VerticalAlignment="Center" Margin="12,0,0,0"
+                       Foreground="{DynamicResource StatusTextBrush}" Text="帧头/帧尾至少配置一项" />
+        </StackPanel>
+    </Grid>
+</Window>
