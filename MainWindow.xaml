@@ -7,110 +7,6 @@
         WindowStartupLocation="CenterScreen"
         FontFamily="Segoe UI" FontSize="12"
         Background="{DynamicResource PanelBackBrush}">
-    <Window.Resources>
-        <!-- 下拉框共用模板：选中项文本过长时以省略号截断（保留下拉箭头），下拉选项仍完整显示。
-             文本列与箭头列分离，默认模板中选中项文字会覆盖箭头，导致长描述时箭头不可见。 -->
-        <ControlTemplate x:Key="ComboBoxTemplate" TargetType="{x:Type ComboBox}">
-            <Grid x:Name="templateRoot" SnapsToDevicePixels="True">
-                <!-- 箭头列固定 18px（与按钮模板内箭头区宽度一致）；若不固定列宽，文本列会
-                     延伸到箭头下方，导致文字与三角形重叠 -->
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="18" />
-                </Grid.ColumnDefinitions>
-                <ToggleButton x:Name="ToggleButton" Grid.ColumnSpan="2" Focusable="False"
-                              IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
-                    <ToggleButton.Template>
-                        <ControlTemplate TargetType="{x:Type ToggleButton}">
-                            <Border x:Name="toggleRoot"
-                                    Background="{DynamicResource InputBackBrush}"
-                                    BorderBrush="{DynamicResource SecondaryBtnBorderBrush}"
-                                    BorderThickness="1" SnapsToDevicePixels="True">
-                                <Border x:Name="splitBorder" Width="18" HorizontalAlignment="Right"
-                                        BorderBrush="{DynamicResource SecondaryBtnBorderBrush}"
-                                        BorderThickness="1,0,0,0">
-                                    <Path x:Name="arrow" Data="M 0 0 L 4 4 L 8 0 Z"
-                                          Fill="{DynamicResource InputForeBrush}"
-                                          HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,1,0,0" />
-                                </Border>
-                            </Border>
-                            <ControlTemplate.Triggers>
-                                <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="toggleRoot" Property="Background"
-                                            Value="{DynamicResource ComboHoverBackBrush}" />
-                                    <Setter TargetName="toggleRoot" Property="BorderBrush"
-                                            Value="{DynamicResource ComboHoverBackBrush}" />
-                                    <Setter TargetName="arrow" Property="Fill"
-                                            Value="{DynamicResource InputForeBrush}" />
-                                </Trigger>
-                                <Trigger Property="IsChecked" Value="True">
-                                    <Setter TargetName="toggleRoot" Property="Background"
-                                            Value="{DynamicResource ComboHoverBackBrush}" />
-                                    <Setter TargetName="toggleRoot" Property="BorderBrush"
-                                            Value="{DynamicResource ComboHoverBackBrush}" />
-                                    <Setter TargetName="arrow" Property="Fill"
-                                            Value="{DynamicResource InputForeBrush}" />
-                                </Trigger>
-                                <Trigger Property="IsEnabled" Value="False">
-                                    <Setter TargetName="toggleRoot" Property="Background"
-                                            Value="{DynamicResource InputBackBrush}" />
-                                    <Setter TargetName="toggleRoot" Property="BorderBrush"
-                                            Value="{DynamicResource SeparatorBrush}" />
-                                    <Setter TargetName="arrow" Property="Fill"
-                                            Value="{DynamicResource SeparatorBrush}" />
-                                </Trigger>
-                            </ControlTemplate.Triggers>
-                        </ControlTemplate>
-                    </ToggleButton.Template>
-                </ToggleButton>
-                <!-- 选中项文本：限定在文本列内，超出部分以省略号截断。
-                     用普通 Binding（而非 TemplateBinding）绑定 SelectionBoxItem，
-                     TemplateBinding 不做对象→字符串转换，会导致选中项不显示。 -->
-                <TextBlock x:Name="SelectionTextBlock" Grid.Column="0" IsHitTestVisible="False"
-                           Text="{Binding SelectionBoxItem, RelativeSource={RelativeSource TemplatedParent}}"
-                           TextTrimming="CharacterEllipsis"
-                           VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
-                           HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
-                           Margin="5,0,0,0"
-                           Foreground="{TemplateBinding Foreground}" />
-                <TextBox x:Name="PART_EditableTextBox" Grid.Column="0"
-                         Visibility="Collapsed"
-                         Text="{TemplateBinding Text}"
-                         VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}"
-                         HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
-                         Margin="4,0,2,0"
-                         Background="Transparent"
-                         BorderThickness="0"
-                         CaretBrush="{TemplateBinding Foreground}"
-                         Foreground="{TemplateBinding Foreground}" />
-                <Popup x:Name="PART_Popup" Grid.ColumnSpan="2" AllowsTransparency="True" Margin="1"
-                       IsOpen="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
-                       PopupAnimation="{DynamicResource {x:Static SystemParameters.ComboBoxPopupAnimationKey}}"
-                       Placement="Bottom">
-                    <!-- 下拉面板：MinWidth 与下拉框同宽，内容更宽时可扩展（完整显示端口描述） -->
-                    <Border x:Name="DropDownBorder"
-                            MinWidth="{Binding ActualWidth, ElementName=ToggleButton}"
-                            MaxHeight="{TemplateBinding MaxDropDownHeight}"
-                            Background="{DynamicResource InputBackBrush}"
-                            BorderBrush="{DynamicResource SecondaryBtnBorderBrush}"
-                            BorderThickness="1">
-                        <ScrollViewer x:Name="DropDownScrollViewer">
-                            <Grid RenderOptions.ClearTypeHint="Enabled">
-                                <ItemsPresenter x:Name="ItemsPresenter"
-                                                KeyboardNavigation.DirectionalNavigation="Contained" />
-                            </Grid>
-                        </ScrollViewer>
-                    </Border>
-                </Popup>
-            </Grid>
-            <ControlTemplate.Triggers>
-                <Trigger Property="IsEditable" Value="True">
-                    <Setter TargetName="PART_EditableTextBox" Property="Visibility" Value="Visible" />
-                    <Setter TargetName="SelectionTextBlock" Property="Visibility" Value="Collapsed" />
-                </Trigger>
-            </ControlTemplate.Triggers>
-        </ControlTemplate>
-    </Window.Resources>
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -197,7 +93,8 @@
                     <Label Content="波特率" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
                     <ComboBox x:Name="cboBaudRate" Width="102" Height="26" IsEditable="True"
                               VerticalContentAlignment="Center"
-                              Template="{StaticResource ComboBoxTemplate}" />
+                              Template="{StaticResource ComboBoxTemplate}"
+                              SelectionChanged="CboBaudRate_Changed" LostFocus="CboBaudRate_Changed" />
                 </StackPanel>
                 <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal" Margin="0,0,0,8">
                     <Label Content="数据位" Padding="0" VerticalAlignment="Center" Margin="0,0,6,0" />
@@ -238,16 +135,21 @@
                               Template="{StaticResource ComboBoxTemplate}"
                               SelectionChanged="CboEncoding_SelectionChanged"
                               ToolTip="接收/发送文本编码（GBK 兼容 GB2312）" />
-                    <CheckBox x:Name="chkTimestamp" Content="时间戳显示" Margin="0,0,12,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkSendHex" Content="16进制发送" Margin="0,0,12,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkReceiveHex" Content="16进制显示" Margin="0,0,12,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkSendNewLine" Content="追加换行符" IsChecked="True"
-                              Margin="0,0,12,0" VerticalAlignment="Center" />
-                    <CheckBox x:Name="chkAutoScroll" Content="自动滚动" IsChecked="True" Margin="0,0,12,0" VerticalAlignment="Center" />
+                    <CheckBox x:Name="chkTimestamp" Content="时间戳显示" Margin="0,0,12,0" VerticalAlignment="Center"
+                              Checked="ChkOption_Changed" Unchecked="ChkOption_Changed" />
+                    <CheckBox x:Name="chkSendHex" Content="16进制发送" Margin="0,0,12,0" VerticalAlignment="Center"
+                              Checked="ChkOption_Changed" Unchecked="ChkOption_Changed" />
+                    <CheckBox x:Name="chkReceiveHex" Content="16进制显示" Margin="0,0,12,0" VerticalAlignment="Center"
+                              Checked="ChkOption_Changed" Unchecked="ChkOption_Changed" />
+                    <CheckBox x:Name="chkSendNewLine" Content="追加换行符" Margin="0,0,12,0" VerticalAlignment="Center"
+                              Checked="ChkOption_Changed" Unchecked="ChkOption_Changed" />
+                    <CheckBox x:Name="chkAutoScroll" Content="自动滚动" Margin="0,0,12,0" VerticalAlignment="Center"
+                              Checked="ChkOption_Changed" Unchecked="ChkOption_Changed" />
                     <CheckBox x:Name="chkPauseReceive" Content="暂停显示" VerticalAlignment="Center"
                               Checked="ChkPauseReceive_Changed" Unchecked="ChkPauseReceive_Changed"
                               ToolTip="暂停接收区刷新，恢复后补齐显示（数据不丢失）" Margin="0,0,12,0" />
                     <CheckBox x:Name="chkLocalEcho" Content="本地回显" VerticalAlignment="Center"
+                              Checked="ChkOption_Changed" Unchecked="ChkOption_Changed"
                               ToolTip="发送的内容以 [TX] 前缀回显到接收区" Margin="0,0,12,0" />
                     <CheckBox x:Name="chkSaveFile" Content="文件保存" VerticalAlignment="Center"
                               Checked="ChkSaveFile_Changed" Unchecked="ChkSaveFile_Changed" />
@@ -301,6 +203,7 @@
                         Width="70" Height="26" />
                 <TextBox x:Name="txtTimerInterval" Width="56" Height="26" Text="1000"
                          VerticalContentAlignment="Center" Margin="10,0,4,0"
+                         LostFocus="TxtTimerInterval_LostFocus"
                          ToolTip="定时发送间隔（毫秒），正整数" />
                 <Label Content="ms" Padding="0" VerticalAlignment="Center" Margin="0,0,8,0" />
                 <Button x:Name="btnTimerSend" Content="定时发送" Click="BtnTimerSend_Click"
@@ -309,7 +212,7 @@
                 <Button x:Name="btnQuickCommands" Content="快捷指令" Click="BtnQuickCommands_Click"
                         Style="{StaticResource SecondaryButtonStyle}"
                         Width="80" Height="26" Margin="8,0,0,0" ToolTip="管理并发送预设快捷指令" />
-                <CheckBox x:Name="chkDtr" Content="DTR" IsChecked="True" IsEnabled="False"
+                <CheckBox x:Name="chkDtr" Content="DTR" IsEnabled="False"
                           Margin="18,0,2,0" VerticalAlignment="Center" Click="ChkPin_Changed"
                           ToolTip="DTR 引脚电平（连接后可切换）" />
                 <CheckBox x:Name="chkRts" Content="RTS" IsEnabled="False"

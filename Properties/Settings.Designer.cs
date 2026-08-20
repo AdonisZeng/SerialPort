@@ -80,5 +80,95 @@ namespace SerialPort.Properties
             get { return ((int)(this["Theme"])); }
             set { this["Theme"] = value; }
         }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("False")]
+        public bool ShowTimestamp
+        {
+            get { return ((bool)(this["ShowTimestamp"])); }
+            set { this["ShowTimestamp"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("False")]
+        public bool SendHex
+        {
+            get { return ((bool)(this["SendHex"])); }
+            set { this["SendHex"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("False")]
+        public bool ReceiveHex
+        {
+            get { return ((bool)(this["ReceiveHex"])); }
+            set { this["ReceiveHex"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("False")]
+        public bool PauseDisplay
+        {
+            get { return ((bool)(this["PauseDisplay"])); }
+            set { this["PauseDisplay"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("False")]
+        public bool LocalEcho
+        {
+            get { return ((bool)(this["LocalEcho"])); }
+            set { this["LocalEcho"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("True")]
+        public bool AppendNewLine
+        {
+            get { return ((bool)(this["AppendNewLine"])); }
+            set { this["AppendNewLine"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("True")]
+        public bool AutoScroll
+        {
+            get { return ((bool)(this["AutoScroll"])); }
+            set { this["AutoScroll"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("True")]
+        public bool Dtr
+        {
+            get { return ((bool)(this["Dtr"])); }
+            set { this["Dtr"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("False")]
+        public bool Rts
+        {
+            get { return ((bool)(this["Rts"])); }
+            set { this["Rts"] = value; }
+        }
+
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("False")]
+        public bool SaveFileChecked
+        {
+            get { return ((bool)(this["SaveFileChecked"])); }
+            set { this["SaveFileChecked"] = value; }
+        }
     }
 }

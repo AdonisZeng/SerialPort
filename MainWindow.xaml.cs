@@ -28,6 +28,7 @@ namespace SerialPort
         private bool _awaitingDevice;    // 已检测到设备拔出、正在等待重新插入（期间冻结端口列表）
         private int _reconnectFailures;  // 连续重连失败次数（达到阈值后状态栏提示一次）
         private FrameParserWindow _frameWindow;   // 帧解析窗口（非空 = 打开中，接收数据喂入）
+        private bool _loadingSettings;   // 构造函数恢复配置期间抑制即时保存（控件赋值会触发变更事件）
         private long _receivedBytesTotal;
         private long _sentBytesTotal;   // 累计发送字节数
         private long _lastStatsRx;      // 上次统计快照的接收字节（计算速率）
@@ -35,7 +36,7 @@ namespace SerialPort
         private DateTime _connectStartedAt;   // 当前连接开始时间（断开后统计区显示 --:--:--）
         private volatile bool _timerSending;   // 定时发送进行中（后台线程循环检查，volatile 保证可见性）
         private int _timerGen;                 // 定时发送代次：每次启动递增，线程捕获自己的代次，代次不匹配立即退出
-        private StreamWriter _saveFileWriter;   // 文件保存流（勾选“文件保存”时创建）
+        private StreamWriter _saveFileWriter;   // 文件保存流（勾选"文件保存"时创建）
         private string _saveFilePath;           // 当前保存文件的完整路径
 
         // 后台文件写入队列：写盘移出 UI 线程，避免高频数据时阻塞界面（锁内访问）
@@ -69,7 +70,9 @@ namespace SerialPort
         {
             InitializeComponent();
 
-            // 文件保存：优先恢复上次路径，否则使用“我的文档”
+            _loadingSettings = true;   // 配置恢复期间抑制即时保存（控件赋值会触发变更事件）
+
+            // 文件保存：优先恢复上次路径，否则使用"我的文档"
             string lastSavePath = Properties.Settings.Default.LastSavePath;
             txtSavePath.Text = !string.IsNullOrWhiteSpace(lastSavePath)
                 ? lastSavePath
@@ -161,22 +164,22 @@ namespace SerialPort
                 _timerSending = false;        // 停止定时发送（后台线程随进程退出）
                 DisposeSaveWriter();          // 关闭保存文件（排空队列后释放）
                 _service.Dispose();           // 关闭串口并释放资源（Dispose 幂等）
-
-                // 保存当前波特率与文件保存路径，下次启动自动恢复
-                if (int.TryParse(cboBaudRate.Text, out int baudRate) && baudRate > 0)
-                    Properties.Settings.Default.LastBaudRate = baudRate;
-
-                if (int.TryParse(txtTimerInterval.Text.Trim(), out int savedTimerInterval) && savedTimerInterval > 0)
-                    Properties.Settings.Default.TimerSendInterval = savedTimerInterval;
-
-                Properties.Settings.Default.Encoding = cboEncoding.SelectedItem?.ToString() ?? "UTF-8";
-
-                string savePath = txtSavePath.Text?.Trim();
-                if (!string.IsNullOrWhiteSpace(savePath))
-                    Properties.Settings.Default.LastSavePath = savePath;
-
-                Properties.Settings.Default.Save();
+                SaveSettings();               // 正常关闭：统一保存所有持久化配置
             };
+
+            // 恢复持久化的复选框状态（赋值触发的事件在 _loadingSettings 下不会即时保存）
+            chkTimestamp.IsChecked = Properties.Settings.Default.ShowTimestamp;
+            chkSendHex.IsChecked = Properties.Settings.Default.SendHex;
+            chkReceiveHex.IsChecked = Properties.Settings.Default.ReceiveHex;
+            chkPauseReceive.IsChecked = Properties.Settings.Default.PauseDisplay;
+            chkLocalEcho.IsChecked = Properties.Settings.Default.LocalEcho;
+            chkSendNewLine.IsChecked = Properties.Settings.Default.AppendNewLine;
+            chkAutoScroll.IsChecked = Properties.Settings.Default.AutoScroll;
+            chkDtr.IsChecked = Properties.Settings.Default.Dtr;
+            chkRts.IsChecked = Properties.Settings.Default.Rts;
+            chkSaveFile.IsChecked = Properties.Settings.Default.SaveFileChecked;
+
+            _loadingSettings = false;
 
             UpdateStatus("就绪");
         }
@@ -378,9 +381,7 @@ namespace SerialPort
         {
             ThemeManager.Toggle();
             btnThemeToggle.Content = ThemeManager.Current == ThemeMode.Dark ? "浅色模式" : "深色模式";
-            // 主题持久化：保存选择，下次启动恢复
-            Properties.Settings.Default.Theme = (int)ThemeManager.Current;
-            Properties.Settings.Default.Save();
+            SaveSettings();   // 主题持久化：立即保存，下次启动恢复
         }
 
         /// <summary>编码下拉切换：重建对应状态保持 Decoder（从干净状态开始），发送编码联动。</summary>
@@ -392,6 +393,28 @@ namespace SerialPort
                 : name == "ASCII" ? Encoding.ASCII
                 : Encoding.UTF8;
             _textDecoder = _textEncoding.GetDecoder();   // 新编码从干净状态开始
+            if (!_loadingSettings) SaveSettings();
+        }
+
+        /// <summary>波特率下拉变更或失焦：立即持久化（可编辑 ComboBox 手动输入时仅 LostFocus 触发）。</summary>
+        private void CboBaudRate_Changed(object sender, RoutedEventArgs e)
+        {
+            if (_loadingSettings) return;
+            SaveSettings();
+        }
+
+        /// <summary>定时发送间隔失焦：立即持久化（避免逐键写盘）。</summary>
+        private void TxtTimerInterval_LostFocus(object sender, RoutedEventArgs e)
+        {
+            if (_loadingSettings) return;
+            SaveSettings();
+        }
+
+        /// <summary>通用复选框持久化：时间戳 / 16进制发送 / 16进制显示 / 追加换行 / 自动滚动 / 本地回显。</summary>
+        private void ChkOption_Changed(object sender, RoutedEventArgs e)
+        {
+            if (_loadingSettings) return;
+            SaveSettings();
         }
 
         // ============================================================
@@ -458,7 +481,7 @@ namespace SerialPort
             // 接收区与筛选缓冲容量上限：超限截头，防止长时运行内存无界增长
             TrimReceiveIfNeeded();
 
-            // 勾选“文件保存”时把同样的内容写入文件（后台队列写盘，不阻塞 UI 线程）
+            // 勾选"文件保存"时把同样的内容写入文件（后台队列写盘，不阻塞 UI 线程）
             EnqueueSaveText(increment);
 
             if (chkAutoScroll.IsChecked == true)
@@ -478,10 +501,13 @@ namespace SerialPort
             if (chkPauseReceive.IsChecked == true)
             {
                 UpdateStatus("接收显示已暂停，数据继续接收中");
-                return;
             }
-            ResumeDisplay();
-            UpdateStatus("已恢复接收显示");
+            else
+            {
+                ResumeDisplay();
+                UpdateStatus("已恢复接收显示");
+            }
+            if (!_loadingSettings) SaveSettings();
         }
 
         /// <summary>恢复显示：把暂停期间累积的文本一次性追加（筛选模式按行过滤，Buffer 已记录不重复）。</summary>
@@ -526,7 +552,7 @@ namespace SerialPort
         /// </summary>
         private const int MaxReceiveChars = 1_000_000;
 
-        /// <summary>截断余量：计数超过“上限 + 余量”才截头，避免高频接收时每块都触发全量拷贝。</summary>
+        /// <summary>截断余量：计数超过"上限 + 余量"才截头，避免高频接收时每块都触发全量拷贝。</summary>
         private const int TrimKeepMargin = 200_000;
 
         /// <summary>接收区（及筛选 Buffer）超过容量上限时截头，保持内存有界。</summary>
@@ -671,8 +697,9 @@ namespace SerialPort
         // ============================================================
         private void ChkPin_Changed(object sender, RoutedEventArgs e)
         {
-            if (!_service.IsConnected) return;   // 未连接时勾选仅作预设
-            ApplyPinStates();
+            if (_service.IsConnected)
+                ApplyPinStates();   // 连接时按勾选写引脚
+            if (!_loadingSettings) SaveSettings();   // 无论是否连接，勾选状态都持久化
         }
 
         /// <summary>把当前勾选的引脚状态写入端口（手动连接 / 自动重连后端口实例重建，需重新应用）。</summary>
@@ -980,15 +1007,18 @@ namespace SerialPort
             if (chkSaveFile.IsChecked == true)
             {
                 StartSaveFile();
-                return;
             }
-            // 取消勾选：关闭当前保存文件（排空队列后释放）
-            DisposeSaveWriter();
-            txtSaveFileName.Text = string.Empty;
-            UpdateFileEditState(_service.IsConnected);
+            else
+            {
+                // 取消勾选：关闭当前保存文件（排空队列后释放）
+                DisposeSaveWriter();
+                txtSaveFileName.Text = string.Empty;
+                UpdateFileEditState(_service.IsConnected);
+            }
+            if (!_loadingSettings) SaveSettings();
         }
 
-        /// <summary>在保存路径下以默认文件名（年月日时分秒）新建文件；路径为空时回退到“我的文档”。</summary>
+        /// <summary>在保存路径下以默认文件名（年月日时分秒）新建文件；路径为空时回退到"我的文档"。</summary>
         private void StartSaveFile()
         {
             string dir = txtSavePath.Text.Trim();
@@ -1030,6 +1060,7 @@ namespace SerialPort
             if (dlg.ShowDialog(new Win32Window(new WindowInteropHelper(this).Handle)) != System.Windows.Forms.DialogResult.OK) return;
 
             txtSavePath.Text = dlg.SelectedPath;
+            SaveSettings();   // 路径选择后立即持久化
             // 保存已开启时路径变更：关闭旧文件，以新路径重新生成默认文件名文件
             if (chkSaveFile.IsChecked == true)
             {
@@ -1169,7 +1200,7 @@ namespace SerialPort
         }
 
         // ============================================================
-        // 软件更新（状态栏“检查更新”入口；启动时自动检查一次）
+        // 软件更新（状态栏"检查更新"入口；启动时自动检查一次）
         // ============================================================
         private void BtnCheckUpdate_Click(object sender, RoutedEventArgs e)
         {
@@ -1191,7 +1222,7 @@ namespace SerialPort
                     var dlg = new UpdateDialog(_updateService, result);
                     dlg.ShowDialog();
                 }
-                // 自动检查（如启动时）：仅状态栏提示，不打断用户，点“检查更新”再弹升级窗口
+                // 自动检查（如启动时）：仅状态栏提示，不打断用户，点"检查更新"再弹升级窗口
             }
             else
             {
@@ -1227,6 +1258,43 @@ namespace SerialPort
         // 工具方法
         // ============================================================
         private void UpdateStatus(string message) => txtStatus.Text = "  " + message;
+
+        /// <summary>
+        /// 把全部持久化配置从 UI 控件写入 Settings 并立即落盘。
+        /// 由各控件变更事件、窗口关闭与 App 级全局异常兜底共同调用：
+        /// "改动即存"保证崩溃/强杀前的配置已写入磁盘，正常关闭再兜底一次。
+        /// </summary>
+        private void SaveSettings()
+        {
+            var s = Properties.Settings.Default;
+
+            if (int.TryParse(cboBaudRate.Text, out int baudRate) && baudRate > 0)
+                s.LastBaudRate = baudRate;
+
+            if (int.TryParse(txtTimerInterval.Text.Trim(), out int timerInterval) && timerInterval > 0)
+                s.TimerSendInterval = timerInterval;
+
+            s.Encoding = cboEncoding.SelectedItem?.ToString() ?? "UTF-8";
+
+            string savePath = txtSavePath.Text?.Trim();
+            if (!string.IsNullOrWhiteSpace(savePath))
+                s.LastSavePath = savePath;
+
+            s.Theme = (int)ThemeManager.Current;
+
+            s.ShowTimestamp = chkTimestamp.IsChecked == true;
+            s.SendHex = chkSendHex.IsChecked == true;
+            s.ReceiveHex = chkReceiveHex.IsChecked == true;
+            s.PauseDisplay = chkPauseReceive.IsChecked == true;
+            s.LocalEcho = chkLocalEcho.IsChecked == true;
+            s.AppendNewLine = chkSendNewLine.IsChecked == true;
+            s.AutoScroll = chkAutoScroll.IsChecked == true;
+            s.Dtr = chkDtr.IsChecked == true;
+            s.Rts = chkRts.IsChecked == true;
+            s.SaveFileChecked = chkSaveFile.IsChecked == true;
+
+            s.Save();
+        }
 
         private static StopBits ParseStopBits(string s)
         {
