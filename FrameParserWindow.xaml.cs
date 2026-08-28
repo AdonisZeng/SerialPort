@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
 using SerialPort.Services;
 
 namespace SerialPort
@@ -39,6 +41,8 @@ namespace SerialPort
 
         private void AddFrame(FrameParser.Frame frame)
         {
+            // 添加前判断是否停在底部：仅跟随滚动，用户上翻查看历史时不被强行拉底
+            bool stickToBottom = IsListAtBottom();
             string checksum = frame.ChecksumOk ? "✓ " + frame.ChecksumText : "✗ " + frame.ChecksumText;
             lstFrames.Items.Add(new
             {
@@ -49,8 +53,33 @@ namespace SerialPort
             });
             while (lstFrames.Items.Count > MaxFrameRows)
                 lstFrames.Items.RemoveAt(0);
-            if (lstFrames.Items.Count > 0)
+            if (stickToBottom && lstFrames.Items.Count > 0)
                 lstFrames.ScrollIntoView(lstFrames.Items[lstFrames.Items.Count - 1]);
+        }
+
+        private ScrollViewer _framesViewer;   // 列表模板内的 ScrollViewer（首次查找后缓存）
+
+        /// <summary>列表是否停在底部（滚动条位于最下端时返回 true）。</summary>
+        private bool IsListAtBottom()
+        {
+            if (_framesViewer == null)
+                _framesViewer = FindVisualChild<ScrollViewer>(lstFrames);
+            if (_framesViewer == null) return true;   // 模板尚未生成：保持原行为（跟随滚动）
+            return _framesViewer.VerticalOffset >= _framesViewer.ScrollableHeight - 1;
+        }
+
+        /// <summary>在视觉树中递归查找指定类型的子元素。</summary>
+        private static T FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
+        {
+            int count = VisualTreeHelper.GetChildrenCount(parent);
+            for (int i = 0; i < count; i++)
+            {
+                DependencyObject child = VisualTreeHelper.GetChild(parent, i);
+                if (child is T hit) return hit;
+                T result = FindVisualChild<T>(child);
+                if (result != null) return result;
+            }
+            return null;
         }
 
         private static string HexText(byte[] data)

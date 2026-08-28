@@ -36,6 +36,8 @@ namespace SerialPort.Services
         private readonly SynchronizationContext _syncContext;
         // 检查中标志（0 = 空闲，1 = 检查中）：UI 线程置位、后台线程复位，用 Interlocked 保证跨线程可见性
         private int _checking;
+        // 上次上报的下载进度百分比（同一百分比不重复上报，降低大文件下载时的 UI 事件频率）
+        private int _lastProgressPercent = -1;
 
         /// <summary>版本检查完成时触发（已在 UI 线程回调），携带检查结果。</summary>
         public event EventHandler<UpdateCheckResult> CheckCompleted;
@@ -119,6 +121,7 @@ namespace SerialPort.Services
                 string newExe = null;   // 下载目标路径：取消时清理残留
                 try
                 {
+                    _lastProgressPercent = -1;   // 重试时保证 0% 会重新上报
                     string workDir = Path.Combine(Path.GetTempPath(), "SerialPortUpdate");
                     Directory.CreateDirectory(workDir);
 
@@ -191,18 +194,23 @@ namespace SerialPort.Services
                 catch (OperationCanceledException)
                 {
                     // 用户取消（更新窗口已关闭）：清理整个临时目录，仅提示不报错
-                    if (newExe != null)
-                    {
-                        string dir = Path.GetDirectoryName(newExe);
-                        try { Directory.Delete(dir, true); } catch { }
-                    }
+                    TryDeleteWorkDir(newExe);
                     Post(() => UpdateError?.Invoke(this, "更新已取消。"));
                 }
                 catch (Exception ex)
                 {
+                    // 失败同样清理临时目录，不留半下载的残留文件
+                    TryDeleteWorkDir(newExe);
                     Post(() => UpdateError?.Invoke(this, "更新失败：" + ex.Message));
                 }
             });
+        }
+
+        /// <summary>尽力删除更新工作目录（含下载残留）；目录不存在 / 被占用时静默忽略。</summary>
+        private static void TryDeleteWorkDir(string newExe)
+        {
+            if (string.IsNullOrEmpty(newExe)) return;
+            try { Directory.Delete(Path.GetDirectoryName(newExe), true); } catch { }
         }
 
         /// <summary>
@@ -432,10 +440,12 @@ namespace SerialPort.Services
             return Version.TryParse(s, out v) ? v : null;
         }
 
-        /// <summary>进度事件编组回 UI 线程。</summary>
+        /// <summary>进度事件编组回 UI 线程（同一百分比只上报一次，避免大文件下载时 UI 事件风暴）。</summary>
         private void ReportProgress(long done, long total)
         {
             int percent = total > 0 ? (int)(done * 100 / total) : 0;
+            if (percent == _lastProgressPercent) return;
+            _lastProgressPercent = percent;
             Post(() => UpdateProgress?.Invoke(this, percent));
         }
 

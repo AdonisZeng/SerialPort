@@ -1,8 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
-using System.Text;
 using System.Threading;
 
 // 本文件位于 namespace SerialPort.Services 内，根命名空间 SerialPort 会遮蔽
@@ -174,27 +173,8 @@ namespace SerialPort.Services
             ConnectionChanged?.Invoke(this, false);
         }
 
-        /// <summary>以文本方式发送数据。逻辑未连接时抛异常；等待重插（物理断开）时静默丢弃。</summary>
-        public void SendText(string text, Encoding encoding)
-        {
-            if (_config == null) throw new InvalidOperationException("串口未连接。");
-
-            byte[] buffer = encoding.GetBytes(text);
-            try
-            {
-                // 物理未打开（设备拔出等待重插）时跳过写入，静默丢弃
-                if (_port != null && _port.IsOpen)
-                    _port.BaseStream.Write(buffer, 0, buffer.Length);
-            }
-            catch (Exception ex)
-            {
-                // 设备拔出（COM 号复用等）时写入抛 IO 类异常：静默丢弃，由 UI 定时器负责重连
-                if (HandleDeviceError(ex)) return;
-                throw;
-            }
-        }
-
-        /// <summary>以十六进制字节方式发送数据。逻辑未连接时抛异常；等待重插（物理断开）时静默丢弃。</summary>
+        /// <summary>以字节数组发送数据。逻辑未连接时抛异常；等待重插（物理断开）时静默丢弃。
+        /// 文本内容由调用方（MainWindow.SendText）先按当前编码转为字节后经此发送。</summary>
         public void SendBytes(byte[] data)
         {
             if (_config == null) throw new InvalidOperationException("串口未连接。");
@@ -242,7 +222,9 @@ namespace SerialPort.Services
                 if (bytes <= 0) return;
 
                 byte[] buffer = new byte[bytes];
-                port.BaseStream.Read(buffer, 0, bytes);
+                int read = port.BaseStream.Read(buffer, 0, bytes);
+                if (read <= 0) return;
+                if (read < bytes) Array.Resize(ref buffer, read);   // 短读防御：截掉尾部未填充的 0x00
 
                 // 攒批：已有同实例的在途批则只追加数据（由该批的 Flush 统一提交），否则开新批并 Post
                 bool postFlush = false;

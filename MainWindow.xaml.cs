@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.IO.Ports;
 using System.Text;
@@ -38,6 +39,7 @@ namespace SerialPort
         private int _timerGen;                 // 定时发送代次：每次启动递增，线程捕获自己的代次，代次不匹配立即退出
         private StreamWriter _saveFileWriter;   // 文件保存流（勾选"文件保存"时创建）
         private string _saveFilePath;           // 当前保存文件的完整路径
+        private bool _saveFilePending;          // 启动恢复的保存勾选：首次有数据需保存时才惰性创建文件
 
         // 后台文件写入队列：写盘移出 UI 线程，避免高频数据时阻塞界面（锁内访问）
         private readonly object _saveLock = new object();
@@ -202,6 +204,7 @@ namespace SerialPort
                         {
                             _awaitingDevice = false;
                             _reconnectFailures = 0;
+                            _connectStartedAt = DateTime.Now;   // 重连后重新计时：物理断开期不计入连接时长
                             ApplyPinStates();   // 重连重建了端口实例：按当前勾选重写引脚
                             UpdateStatus($"检测到 {_service.PortName} 已重新连接");
                         }
@@ -620,11 +623,12 @@ namespace SerialPort
             StringBuilder sb = new StringBuilder(increment.Length + 12);
             bool atLineStart = _atLineStart;
             DateTime now = DateTime.Now;   // 同一数据块的所有行共享同一时刻（秒级精度下无差别）
+            string stamp = "[" + now.ToString("HH:mm:ss") + "] ";   // 块内不变：循环外格式化一次
             foreach (char c in increment)
             {
                 if (atLineStart && !IsNewLineChar(c))
                 {
-                    sb.Append('[').Append(now.ToString("HH:mm:ss")).Append("] ");
+                    sb.Append(stamp);
                     atLineStart = false;
                 }
                 sb.Append(c);
@@ -669,8 +673,9 @@ namespace SerialPort
                 }
                 else
                 {
-                    _service.SendText(text, _textEncoding);
-                    _sentBytesTotal += _textEncoding.GetByteCount(text);
+                    byte[] bytes = _textEncoding.GetBytes(text);   // 编码一次：字节数直接取自数组，不再二次 GetByteCount
+                    _service.SendBytes(bytes);
+                    _sentBytesTotal += bytes.Length;
                     AppendLocalEcho(text);
                 }
                 return true;
@@ -779,6 +784,7 @@ namespace SerialPort
             if (_frameWindow == null)
             {
                 _frameWindow = new FrameParserWindow();
+                _frameWindow.Owner = this;   // 设所有者：主窗口关闭时子窗口随之关闭，进程才能正常退出
                 _frameWindow.Closed += (s, args) => _frameWindow = null;
             }
             if (_frameWindow.IsVisible)
@@ -913,15 +919,24 @@ namespace SerialPort
             // 不变量：PendingLine 中不含换行；仅当本块含换行时才整行拆分处理
             if (increment.IndexOfAny(NewLineChars) < 0)
             {
-                _filterState.PendingLine.Append(increment);
+                AppendPendingLine(increment);
                 return;
             }
-            _filterState.PendingLine.Append(increment);
+            AppendPendingLine(increment);
             string[] lines = SplitLines(_filterState.PendingLine.ToString());
             _filterState.PendingLine.Clear();
             _filterState.PendingLine.Append(lines[lines.Length - 1]);   // 末段可能是不完整的一行，继续暂存
             for (int i = 0; i < lines.Length - 1; i++)
                 AppendLineIfMatches(lines[i]);
+        }
+
+        /// <summary>追加到未完成行暂存（含超限截头：无换行的持续数据流如二进制会使其无界增长）。</summary>
+        private void AppendPendingLine(string s)
+        {
+            StringBuilder pending = _filterState.PendingLine;
+            pending.Append(s);
+            if (pending.Length > MaxReceiveChars + TrimKeepMargin)
+                pending.Remove(0, MaxReceiveChars);   // 截头保留最近片段：该行本就不完整，丢弃头部可接受
         }
 
         /// <summary>整行包含筛选内容时追加显示（含行尾换行）。</summary>
@@ -1006,11 +1021,15 @@ namespace SerialPort
         {
             if (chkSaveFile.IsChecked == true)
             {
-                StartSaveFile();
+                if (_loadingSettings)
+                    _saveFilePending = true;   // 启动恢复勾选：不立即建文件，首次数据到达时惰性创建
+                else
+                    StartSaveFile();
             }
             else
             {
                 // 取消勾选：关闭当前保存文件（排空队列后释放）
+                _saveFilePending = false;
                 DisposeSaveWriter();
                 txtSaveFileName.Text = string.Empty;
                 UpdateFileEditState(_service.IsConnected);
@@ -1028,24 +1047,35 @@ namespace SerialPort
                 txtSavePath.Text = dir;
             }
             string name = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".txt";
+            if (TryOpenSaveWriter(Path.Combine(dir, name)))
+            {
+                txtSaveFileName.Text = name;
+                UpdateStatus($"开始保存到 {_saveFilePath}");
+            }
+            UpdateFileEditState(_service.IsConnected);
+        }
+
+        /// <summary>在指定路径打开保存流（AutoFlush 关闭，由后台写队列批量刷盘）；失败取消勾选并提示。</summary>
+        private bool TryOpenSaveWriter(string filePath)
+        {
+            _saveFilePending = false;
             try
             {
-                var writer = new StreamWriter(Path.Combine(dir, name), true, new UTF8Encoding(false))
+                var writer = new StreamWriter(filePath, true, new UTF8Encoding(false))
                 {
                     AutoFlush = false   // 由后台写队列批量写盘，避免高频 flush 阻塞 UI
                 };
                 lock (_saveLock) _saveFileWriter = writer;   // 与后台写线程同步可见
-                _saveFilePath = Path.Combine(dir, name);
-                txtSaveFileName.Text = name;
-                UpdateStatus($"开始保存到 {_saveFilePath}");
+                _saveFilePath = filePath;
+                return true;
             }
             catch (Exception ex)
             {
                 lock (_saveLock) _saveFileWriter = null;
                 chkSaveFile.IsChecked = false;   // 创建失败则取消勾选，保持状态一致
                 MessageBox.Show($"创建保存文件失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                return false;
             }
-            UpdateFileEditState(_service.IsConnected);
         }
 
         /// <summary>浏览按钮：弹出文件夹选择窗口，选择文件保存路径。</summary>
@@ -1069,7 +1099,8 @@ namespace SerialPort
             }
         }
 
-        /// <summary>修改文件名（仅串口关闭时可用）：重命名磁盘上的当前保存文件。</summary>
+        /// <summary>修改文件名（仅串口关闭时可用）：重命名磁盘上的当前保存文件。
+        /// 重命名前必须释放 StreamWriter 持有的句柄（FileShare.Read 不含删除共享，句柄打开时 Move 必失败）。</summary>
         private void BtnModifyFileName_Click(object sender, RoutedEventArgs e)
         {
             if (_service.IsConnected)
@@ -1100,6 +1131,7 @@ namespace SerialPort
                 MessageBox.Show($"同名文件已存在：{name}", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
+            DisposeSaveWriter();   // 排空队列并释放句柄，文件解除占用后才能改名
             try
             {
                 File.Move(_saveFilePath, newPath);
@@ -1111,6 +1143,8 @@ namespace SerialPort
             {
                 MessageBox.Show($"重命名失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
             }
+            // 无论是否改名成功，都按当前路径重建保存流（TryOpen 失败会自动取消勾选），保持勾选状态继续保存
+            if (chkSaveFile.IsChecked == true) TryOpenSaveWriter(_saveFilePath);
         }
 
         /// <summary>文件名编辑状态：未勾选文件保存或串口已打开时均禁止修改文件名。</summary>
@@ -1124,6 +1158,12 @@ namespace SerialPort
         /// <summary>把接收文本加入后台写盘队列（写盘不阻塞 UI 线程；队列空则启动排空任务）。</summary>
         private void EnqueueSaveText(string text)
         {
+            if (_saveFilePending)
+            {
+                // 启动恢复的保存勾选：首次有数据需要保存时才真正创建文件（避免每次启动即建新文件）
+                StartSaveFile();
+                lock (_saveLock) { if (_saveFileWriter == null) return; }   // 创建失败（已取消勾选）：放弃保存
+            }
             lock (_saveLock)
             {
                 if (_saveFileWriter == null) return;   // 未开启文件保存
@@ -1343,7 +1383,7 @@ namespace SerialPort
             return value;
         }
 
-        /// <summary>将 "A1 B2 3C" 形式的字符串解析为字节数组，忽略空格/换行。</summary>
+        /// <summary>将 "A1 B2 3C" 形式的字符串解析为字节数组，忽略空格/换行；非法字符给出明确中文提示。</summary>
         private static byte[] HexStringToBytes(string hex)
         {
             string cleaned = hex.Replace(" ", "").Replace("\r", "").Replace("\n", "").Replace("\t", "");
@@ -1352,7 +1392,8 @@ namespace SerialPort
 
             byte[] bytes = new byte[cleaned.Length / 2];
             for (int i = 0; i < bytes.Length; i++)
-                bytes[i] = Convert.ToByte(cleaned.Substring(i * 2, 2), 16);
+                if (!byte.TryParse(cleaned.Substring(i * 2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out bytes[i]))
+                    throw new FormatException("Hex 格式错误：包含非法字符（仅允许 0-9 / A-F / a-f 和空白）。");
             return bytes;
         }
     }

@@ -1,11 +1,11 @@
-﻿<Application x:Class="SerialPort.App"
+<Application x:Class="SerialPort.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              StartupUri="MainWindow.xaml">
     <Application.Resources>
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>
-                <!-- 第 0 项必须为默认主题：ThemeManager.Apply 按索引 0 替换 -->
+                <!-- 默认主题（浅色）：ThemeManager.Apply 按 Source 定位替换，找不到时才插入到最前 -->
                 <ResourceDictionary Source="Themes/LightTheme.xaml" />
             </ResourceDictionary.MergedDictionaries>
 

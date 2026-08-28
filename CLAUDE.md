@@ -39,7 +39,7 @@ Visual Studio 2026 安装在 `D:\Software\Microsoft Visual Studio\18\Community`�
 
 ### 发送
 
-`SendText`（字符串 → 按调用方编码转为字节，界面中为 UTF-8）和 `SendBytes`（原始十六进制）都写入 `_port.BaseStream`。逻辑未连接时抛出 `InvalidOperationException`；逻辑已连接但物理断开（设备拔出、等待重插）时**静默丢弃**，不抛异常。`DiscardInBuffer` 调用框架 `SerialPort.DiscardInBuffer()` 真正丢弃输入缓冲区中尚未读取的数据（UI 暂未使用）。
+`SendBytes`（字节数组写入 `_port.BaseStream`）是服务层唯一发送入口；文本由 UI 层 `MainWindow.SendText`（hex / 文本 / 追加换行 / 编码解析，累计发送字节）先按当前编码转为字节后调用。逻辑未连接时抛出 `InvalidOperationException`；逻辑已连接但物理断开（设备拔出、等待重插）时**静默丢弃**，不抛异常。`DiscardInBuffer` 调用框架 `SerialPort.DiscardInBuffer()` 真正丢弃输入缓冲区中尚未读取的数据（UI 暂未使用）。
 
 ### 自动更新
 
