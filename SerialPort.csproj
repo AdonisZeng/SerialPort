@@ -178,6 +178,21 @@
       <Compile Include="$(IntermediateOutputPath)VersionInfo.cs" />
     </ItemGroup>
   </Target>
+  <!-- 构建后自动生成 SHA256 校验文件（自动更新用附件，随 exe 一同产出）。
+       文件名必须是"exe 全名 + .sha256"：UpdateService 以运行中的 exe 文件名
+       （Path.GetFileName，即 SerialPort.exe）拼接 .sha256 去 Release 附件里精确匹配。
+       内容为 64 位十六进制 + 空格 + 文件名（sha256sum 兼容格式；ASCII 编码避免 BOM）。
+       原来靠手工生成，一旦"先算哈希、之后又重新编译"，校验文件就与新 exe 不匹配，
+       客户端更新时会因校验失败中止，故改由构建产出，杜绝哈希与 exe 不同步。 -->
+  <Target Name="AfterBuild">
+    <GetFileHash Files="$(TargetPath)" Algorithm="SHA256">
+      <Output TaskParameter="Hash" PropertyName="_ExeSha256" />
+    </GetFileHash>
+    <WriteLinesToFile File="$(TargetDir)$(TargetFileName).sha256"
+                      Lines="$(_ExeSha256.ToLowerInvariant()) $(TargetFileName)"
+                      Overwrite="true"
+                      Encoding="ASCII" />
+  </Target>
   <!-- 注意：旧式 WPF 工程的标记编译依赖 VS 安装的 PresentationBuildTasks（.NET Framework 程序集），
        dotnet CLI 的 MSBuild 无法加载它，故本项目请用 VS 的 MSBuild.exe 构建（见 CLAUDE.md）。 -->
 </Project>

@@ -43,6 +43,20 @@ Visual Studio 2026 安装在 `D:\Software\Microsoft Visual Studio\18\Community`�
 
 `SendBytes`（字节数组写入 `_port.BaseStream`）是服务层唯一发送入口，**返回 bool 表示是否真正写出**；文本由 UI 层 `MainWindow.SendText`（hex / 文本 / 追加换行 / 编码解析）先按当前编码转为字节后调用，且**仅在返回 true 时**累计发送字节（否则设备断开期间的丢弃会让统计虚高）。逻辑未连接时抛出 `InvalidOperationException`；逻辑已连接但物理断开（设备拔出、等待重插）时丢弃并返回 false（**并非静默**：会经 `DeviceError` 上报一次"设备未打开"提示，受全局节流保护），不抛异常（`SendText` 的返回值语义不变：false = 未发出 / 解析失败，丢弃仍返回 true，否则设备拔出期间定时发送会被误停）。`DiscardInBuffer` 调用框架 `SerialPort.DiscardInBuffer()` 真正丢弃输入缓冲区中尚未读取的数据（UI 暂未使用）。
 
+### 发布 Release
+
+`SerialPort.csproj` 的 `AfterBuild` 目标在每次构建后用 `GetFileHash` 计算 exe 的 SHA256，并写入输出目录的 `SerialPort.exe.sha256`（ASCII，64 位哈希 + 空格 + 文件名）。**该文件是发布附件之一，不要手工生成**——构建非确定性（MVID 变化），每次编译 exe 哈希都不同，手工算好哈希后再编译就会得到一对不匹配的 exe 与校验文件，客户端校验失败会直接中止更新。
+
+发布到 GitHub Release 的附件按名字精确匹配（`exeName` 取运行中的 exe 文件名）：
+
+| 附件名 | 必需 | 说明 |
+| --- | --- | --- |
+| `SerialPort.exe` | 是 | 主程序 |
+| `SerialPort.exe.sha256` | 是 | 缺失即拒绝更新 |
+| `SerialPort.exe.config` | 否 | 缺失时跳过，进度条把剩余区间让给校验文件 |
+
+版本号只改 `SerialPort.csproj` 的 `<Version>`，tag 用 `v` 前缀与之对应；附件更新时先删同名旧附件再上传（GitHub 不允许同名）。
+
 ### 自动更新
 
 `UpdateService` 通过 GitHub Releases 检查新版本：网页端 `/releases/latest` 302 跳转解析 tag（不消耗 API 配额），确认有新版本才调 API 补全发布说明与附件地址；结果缓存 12 小时，`_checking` 用 `Interlocked` 管理并发；检查类请求 15 秒超时，下载类 10 分钟超时（HttpClient 默认 100 秒对大文件偏短）。`UpdateDialog` 确认后下载 → SHA256 校验（**校验文件缺失即拒绝更新**）→ 替换 exe → 启动新版本退出。下载任务接受 `CancellationToken`（`GetAsync` 也要传，否则响应头阶段无法取消）：**更新窗口关闭即取消**，替换程序前做最后一次取消检查。三个附件（exe 0-90% / sha256 90-95% / config 95-100%）共用一条进度条，按区间映射保证进度单调上升。取消与超时以 `token.IsCancellationRequested` 区分（`HttpClient` 超时抛的 `TaskCanceledException` 也派生自 `OperationCanceledException`）；`Process.Start` 失败单独提示"新版本已安装，但启动失败，请手动启动程序"，因为此时 exe 已被替换。检查区分手动/自动：手动检查失败才弹窗，启动时自动检查仅在状态栏提示。
