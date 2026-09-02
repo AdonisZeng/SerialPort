@@ -8,6 +8,7 @@ using System.Reflection;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
 using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -32,6 +33,12 @@ namespace SerialPort.Services
 
         /// <summary>检查结果缓存有效期：此时间内直接使用本地缓存，不再发网络请求（自动检查用）。</summary>
         private static readonly TimeSpan CacheMaxAge = TimeSpan.FromHours(12);
+
+        /// <summary>版本检查请求超时（默认 100 秒过长：网络不通时应尽快给出提示）。</summary>
+        private static readonly TimeSpan CheckTimeout = TimeSpan.FromSeconds(15);
+
+        /// <summary>下载请求超时：单个附件的整体时限（程序本体可能数 MB，慢网下需放宽）。</summary>
+        private static readonly TimeSpan DownloadTimeout = TimeSpan.FromMinutes(10);
 
         private readonly SynchronizationContext _syncContext;
         // 检查中标志（0 = 空闲，1 = 检查中）：UI 线程置位、后台线程复位，用 Interlocked 保证跨线程可见性
@@ -98,9 +105,18 @@ namespace SerialPort.Services
                 {
                     Post(() => UpdateError?.Invoke(this, "检查更新失败：无法连接到 GitHub，请检查网络后重试。"));
                 }
-                catch (Exception ex)
+                catch (Exception raw)
                 {
-                    Post(() => UpdateError?.Invoke(this, "检查更新失败：" + ex.Message));
+                    // 版本检查走同步 .Result：HttpClient 超时（CheckTimeout）抛出的 TaskCanceledException
+                    // 会被包成 AggregateException，直接取 raw.Message 只会显示"发生一个或多个错误。"
+                    // 只拆"恰好一个内层"的聚合体，避免把真正的多异常压平后丢失信息
+                    Exception ex = raw is AggregateException agg && agg.InnerExceptions.Count == 1
+                        ? agg.InnerExceptions[0]
+                        : raw;
+                    string message = ex is TaskCanceledException
+                        ? "检查更新超时（" + (int)CheckTimeout.TotalSeconds + " 秒），请检查网络后重试。"
+                        : "检查更新失败：" + ex.Message;
+                    Post(() => UpdateError?.Invoke(this, message));
                 }
                 finally
                 {
@@ -130,12 +146,15 @@ namespace SerialPort.Services
                     newExe = Path.Combine(workDir, exeName);
 
                     // 1. 下载新程序与 SHA256 校验文件（带进度报告，支持取消）
+                    //    多个文件共用一条进度条：按大小分配区间（程序 0-90%，校验文件 90-95%，配置文件 95-100%）。
+                    //    无 config 附件时校验文件独占 90-100%，否则进度条会永远停在 95%。
                     Post(() => UpdateProgress?.Invoke(this, 0));
-                    await DownloadFileAsync(result.ExeUrl, newExe, token).ConfigureAwait(false);
+                    await DownloadFileAsync(result.ExeUrl, newExe, token, 0, 90).ConfigureAwait(false);
                     if (string.IsNullOrEmpty(result.Sha256Url))
                         throw new IOException("Release 附件中缺少 SHA256 校验文件，为安全起见已取消更新。");
+                    int hashSpan = string.IsNullOrEmpty(result.ConfigUrl) ? 10 : 5;
                     string hashFile = Path.Combine(workDir, exeName + ".sha256");
-                    await DownloadFileAsync(result.Sha256Url, hashFile, token).ConfigureAwait(false);
+                    await DownloadFileAsync(result.Sha256Url, hashFile, token, 90, hashSpan).ConfigureAwait(false);
                     VerifySha256(newExe, hashFile);
 
                     // 2. 尽力下载配置文件（发布包含 config 时）；失败不阻断升级。
@@ -146,7 +165,7 @@ namespace SerialPort.Services
                         try
                         {
                             newConfig = Path.Combine(workDir, exeName + ".config");
-                            await DownloadFileAsync(result.ConfigUrl, newConfig, token).ConfigureAwait(false);
+                            await DownloadFileAsync(result.ConfigUrl, newConfig, token, 90 + hashSpan, 100 - 90 - hashSpan).ConfigureAwait(false);
                         }
                         catch (OperationCanceledException)
                         {
@@ -187,15 +206,29 @@ namespace SerialPort.Services
                         try { File.Copy(newConfig, exePath + ".config", true); } catch { }
                     }
 
-                    // 5. 启动新版本，退出当前进程
-                    Process.Start(exePath);
+                    // 5. 启动新版本，退出当前进程。
+                    //    此刻程序文件已被替换，启动失败不能笼统报"更新失败"——用户只会以为没更新成功，
+                    //    实际磁盘上已是新版本，必须明确告知手动启动。
+                    try
+                    {
+                        Process.Start(exePath);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new IOException("新版本已安装，但启动失败，请手动启动程序：" + ex.Message, ex);
+                    }
                     Post(() => UpdateApplied?.Invoke(this, EventArgs.Empty));
                 }
                 catch (OperationCanceledException)
                 {
-                    // 用户取消（更新窗口已关闭）：清理整个临时目录，仅提示不报错
+                    // 用户取消（更新窗口已关闭）：清理整个临时目录，仅提示不报错。
+                    // 注意：HttpClient 超时抛出的 TaskCanceledException 也派生自 OperationCanceledException，
+                    // 以 token 状态区分"用户取消"与"下载超时"，避免超时被误报成用户取消。
                     TryDeleteWorkDir(newExe);
-                    Post(() => UpdateError?.Invoke(this, "更新已取消。"));
+                    string message = token.IsCancellationRequested
+                        ? "更新已取消。"
+                        : "更新下载超时，请检查网络后重试。";
+                    Post(() => UpdateError?.Invoke(this, message));
                 }
                 catch (Exception ex)
                 {
@@ -244,6 +277,7 @@ namespace SerialPort.Services
             var handler = new HttpClientHandler { AllowAutoRedirect = false };   // 不跟随跳转，直接读 Location 头
             using (var client = new HttpClient(handler))
             {
+                client.Timeout = CheckTimeout;   // 网络不通时尽快失败，不在后台挂 100 秒
                 client.DefaultRequestHeaders.Add("User-Agent", "SerialPort-Update-Checker");   // GitHub 要求 UA
                 using (HttpResponseMessage resp = client.GetAsync(string.Format(ReleaseLatestWebUrl, GitHubOwner, GitHubRepo)).Result)
                 {
@@ -272,6 +306,7 @@ namespace SerialPort.Services
         {
             using (var client = new HttpClient())
             {
+                client.Timeout = CheckTimeout;   // 同版本检查：网络不通时尽快失败
                 client.DefaultRequestHeaders.Add("User-Agent", "SerialPort-Update-Checker");   // GitHub API 要求 UA
                 using (HttpResponseMessage resp = client.GetAsync(string.Format(LatestReleaseUrl, GitHubOwner, GitHubRepo)).Result)
                 {
@@ -382,13 +417,20 @@ namespace SerialPort.Services
             }
         }
 
-        /// <summary>下载文件到目标路径，期间按已读字节数报告进度。</summary>
-        private async Task DownloadFileAsync(string url, string destPath, CancellationToken token)
+        /// <summary>
+        /// 下载文件到目标路径，期间按已读字节数报告进度。
+        /// basePercent / spanPercent：本文件在整条进度条上占据的区间（见 DownloadAndApplyAsync 的分配），
+        /// 使连续下载多个文件时进度单调上升，不会每换一个文件就从 0 重新计。
+        /// </summary>
+        private async Task DownloadFileAsync(string url, string destPath, CancellationToken token,
+            int basePercent, int spanPercent)
         {
             using (var client = new HttpClient())
             {
+                client.Timeout = DownloadTimeout;   // 下载整体时限（默认 100 秒对大文件偏短，放宽）
                 client.DefaultRequestHeaders.Add("User-Agent", "SerialPort-Update-Checker");
-                using (HttpResponseMessage resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false))
+                // 传 token：响应头阶段也能响应取消（否则关窗后仍会卡在等待响应）
+                using (HttpResponseMessage resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false))
                 {
                     resp.EnsureSuccessStatusCode();
                     long total = resp.Content.Headers.ContentLength ?? 0;
@@ -402,7 +444,7 @@ namespace SerialPort.Services
                         {
                             await output.WriteAsync(buffer, 0, read, token).ConfigureAwait(false);
                             done += read;
-                            ReportProgress(done, total);
+                            ReportProgress(done, total, basePercent, spanPercent);
                         }
                     }
                 }
@@ -425,11 +467,18 @@ namespace SerialPort.Services
         /// <summary>读取校验文件的第一段（64 位十六进制，可能后随文件名）。</summary>
         private static string ReadSha256(string hashFilePath)
         {
-            string content = File.ReadAllText(hashFilePath).Trim();
+            string content;
+            // 带 BOM 探测：UTF-8 BOM 不会自动被 Trim 掉，残留会导致哈希比对恒失败、更新无法进行
+            using (var reader = new StreamReader(hashFilePath, Encoding.UTF8, true))
+                content = reader.ReadToEnd();
+            content = content.Trim().Trim(BomChar);
             string[] parts = content.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length == 0) throw new InvalidDataException("SHA256 校验文件为空。");
             return parts[0].ToLowerInvariant();
         }
+
+        /// <summary>字节序标记字符（U+FEFF）。</summary>
+        private const char BomChar = '\uFEFF';
 
         /// <summary>把 "v1.0.1" 形式的 tag 解析为版本号；解析失败返回 null。</summary>
         private static Version ParseTagVersion(string tag)
@@ -440,10 +489,14 @@ namespace SerialPort.Services
             return Version.TryParse(s, out v) ? v : null;
         }
 
-        /// <summary>进度事件编组回 UI 线程（同一百分比只上报一次，避免大文件下载时 UI 事件风暴）。</summary>
-        private void ReportProgress(long done, long total)
+        /// <summary>
+        /// 进度事件编组回 UI 线程（同一百分比只上报一次，避免大文件下载时 UI 事件风暴）。
+        /// 本文件进度映射到 [basePercent, basePercent + spanPercent] 区间，保证多文件下载时进度单调上升。
+        /// </summary>
+        private void ReportProgress(long done, long total, int basePercent, int spanPercent)
         {
-            int percent = total > 0 ? (int)(done * 100 / total) : 0;
+            int percent = total > 0 ? basePercent + (int)(done * spanPercent / total) : basePercent;
+            if (percent > 100) percent = 100;   // 防御：ContentLength 与实际大小不符时钳位
             if (percent == _lastProgressPercent) return;
             _lastProgressPercent = percent;
             Post(() => UpdateProgress?.Invoke(this, percent));

@@ -35,11 +35,22 @@ namespace SerialPort.Services
         /// <summary>当接收到数据时触发（已在 UI 线程上回调）。</summary>
         public event EventHandler<DataReceivedEventArgs> DataReceived;
 
-        /// <summary>当串口打开/关闭状态变化时触发（已在 UI 线程上回调）。</summary>
+        /// <summary>当串口打开/关闭状态变化时触发（在调用线程同步回调，非 Post 编组）。</summary>
         public event EventHandler<bool> ConnectionChanged;
 
+        /// <summary>
+        /// 设备异常（拔出 / IO 错误 / 读写超时）时触发（已在 UI 线程回调），携带中文提示文本。
+        /// 仅用于状态栏告知：同一消息 2 秒内最多上报一次，避免高频错误淹没界面。
+        /// </summary>
+        public event EventHandler<string> DeviceError;
+
+        // 设备错误上报节流（后台线程产生，UI 线程消费）
+        private readonly object _errorLock = new object();
+        private DateTime _lastErrorAt;         // 上次上报时刻（UTC）；按时间全局节流，不区分错误文本
+        private static readonly TimeSpan ErrorReportInterval = TimeSpan.FromSeconds(2);
+
         /// <summary>物理连接状态：底层串口是否真正打开（设备拔出 / IO 错误后可能为 false）。</summary>
-        public bool IsOpen => _port?.IsOpen ?? false;
+        public bool IsOpen => TryGetOpenPort() != null;   // 同样走锁内取快照，不直读 _port
 
         /// <summary>逻辑连接状态：打开后直到手动关闭（设备拔出等待重插期间仍为 true，UI 以此为据）。</summary>
         public bool IsConnected => _config != null;
@@ -173,21 +184,48 @@ namespace SerialPort.Services
             ConnectionChanged?.Invoke(this, false);
         }
 
-        /// <summary>以字节数组发送数据。逻辑未连接时抛异常；等待重插（物理断开）时静默丢弃。
-        /// 文本内容由调用方（MainWindow.SendText）先按当前编码转为字节后经此发送。</summary>
-        public void SendBytes(byte[] data)
+        /// <summary>
+        /// 在 _portLock 内取一次端口快照：仅当端口存在且物理打开时返回该实例，否则 null。
+        /// 供所有读写引脚 / 收发的方法统一使用，避免与 DisposePort 竞态下重复读 _port 拿到 null。
+        /// 返回的实例在锁外使用时可能已被释放，调用方须自行捕获 IO 类异常（见 HandleDeviceError）。
+        /// </summary>
+        private SerialPortType TryGetOpenPort()
+        {
+            lock (_portLock)
+            {
+                SerialPortType port = _port;
+                return port != null && port.IsOpen ? port : null;
+            }
+        }
+
+        /// <summary>
+        /// 以字节数组发送数据。返回是否真正写出：
+        /// 逻辑未连接时抛异常；等待重插（物理断开）或设备异常时丢弃并返回 false。
+        /// 丢弃并非静默：会经 <see cref="DeviceError"/> 上报一次提示（已按时间节流）。
+        /// 文本内容由调用方（MainWindow.SendText）先按当前编码转为字节后经此发送。
+        /// </summary>
+        public bool SendBytes(byte[] data)
         {
             if (_config == null) throw new InvalidOperationException("串口未连接。");
+            SerialPortType port = TryGetOpenPort();
+            if (port == null)
+            {
+                // 物理未打开（设备拔出但 COM 号未消失 / 端口正在重建）：丢弃数据，
+                // 但仍上报一次——否则"设备异常不再静默"的改造在这条路径上被绕过，
+                // 定时发送会长时间空转而状态栏毫无提示（服务层已按时间节流，不会刷屏）
+                ReportDeviceError("设备未打开，本次数据已丢弃，等待重新连接");
+                return false;
+            }
             try
             {
-                // 物理未打开（设备拔出等待重插）时跳过写入，静默丢弃
-                if (_port != null && _port.IsOpen)
-                    _port.BaseStream.Write(data, 0, data.Length);
+                port.BaseStream.Write(data, 0, data.Length);
+                return true;
             }
             catch (Exception ex)
             {
-                // 设备拔出（COM 号复用等）时写入抛 IO 类异常：静默丢弃，由 UI 定时器负责重连
-                if (HandleDeviceError(ex)) return;
+                // 设备拔出（COM 号复用等）时写入抛 IO 类异常：丢弃并由 HandleDeviceError 上报，
+                // 由 UI 定时器负责重连
+                if (HandleDeviceError(ex)) return false;
                 throw;
             }
         }
@@ -195,19 +233,28 @@ namespace SerialPort.Services
         /// <summary>真正丢弃输入缓冲区中尚未读取的数据（仅物理打开时有效）。</summary>
         public void DiscardInBuffer()
         {
-            if (_port != null && _port.IsOpen) _port.DiscardInBuffer();
+            SerialPortType port = TryGetOpenPort();
+            if (port == null) return;
+            try { port.DiscardInBuffer(); }
+            catch (Exception ex) { HandleDeviceError(ex); }   // 端口刚被释放：忽略
         }
 
         /// <summary>设置 DTR 引脚状态（仅物理打开时生效；未打开静默忽略，重连后由端口默认值接管）。</summary>
         public void SetDtr(bool enable)
         {
-            if (_port != null && _port.IsOpen) _port.DtrEnable = enable;
+            SerialPortType port = TryGetOpenPort();
+            if (port == null) return;
+            try { port.DtrEnable = enable; }
+            catch (Exception ex) { HandleDeviceError(ex); }
         }
 
         /// <summary>设置 RTS 引脚状态（仅物理打开时生效；未打开静默忽略，重连后由端口默认值接管）。</summary>
         public void SetRts(bool enable)
         {
-            if (_port != null && _port.IsOpen) _port.RtsEnable = enable;
+            SerialPortType port = TryGetOpenPort();
+            if (port == null) return;
+            try { port.RtsEnable = enable; }
+            catch (Exception ex) { HandleDeviceError(ex); }
         }
 
         private void OnSerialDataReceived(object sender, SerialDataReceivedEventArgs e)
@@ -272,16 +319,50 @@ namespace SerialPort.Services
 
         /// <summary>
         /// 统一判定"设备已不可用"（拔出但端口名未消失等）：逻辑连接期间遇 IO 类异常、
-        /// 端口关闭/重建竞态异常或读写超时时，视为设备已不可用，静默丢弃本次收发，
-        /// 由 UI 定时器检测拔出并自动重连。返回是否已按此处理。
+        /// 端口关闭/重建竞态异常或读写超时时，视为设备已不可用，丢弃本次收发，
+        /// 由 UI 定时器检测拔出并自动重连；同时经 DeviceError 事件上报一次提示（状态栏可见）。
+        /// 返回是否已按此处理。
         /// 注意：不能用 _port.IsOpen 判定——致命 IO 错误后 SerialStream 已被自动关闭，
         /// 以 IsOpen 判定会漏报（这正是旧版拔出后界面状态不更新的根源）。
         /// </summary>
-        private bool HandleDeviceError(Exception ex) =>
-            _config != null && (ex is IOException
+        private bool HandleDeviceError(Exception ex)
+        {
+            if (_config == null) return false;
+            if (!(ex is IOException
                 || ex is UnauthorizedAccessException
                 || ex is InvalidOperationException    // 端口正在被关闭/重建（流已释放）时的写竞态
-                || ex is TimeoutException);           // 设备无响应：读/写超时
+                || ex is TimeoutException))           // 设备无响应：读/写超时
+                return false;
+            ReportDeviceError(DescribeDeviceError(ex));
+            return true;
+        }
+
+        /// <summary>把设备异常翻译成中文提示（状态栏展示用）。</summary>
+        private static string DescribeDeviceError(Exception ex)
+        {
+            if (ex is TimeoutException) return "设备无响应（读/写超时），数据已丢弃，等待重新连接";
+            if (ex is UnauthorizedAccessException) return "串口被其他程序占用，等待重新连接";
+            if (ex is InvalidOperationException) return "端口正在重建，本次操作已丢弃";
+            return "设备已断开或读写失败，等待重新连接";   // IOException
+        }
+
+        /// <summary>
+        /// 上报设备错误（节流后 Post 回 UI 线程）：2 秒内最多上报一次（不论文本）。
+        /// 串口错误在高频收发时可能每秒成百上千次，不去重会把 UI 消息队列打满。
+        /// 只比较"上一条文本"是不够的：设备拔出时 IOException（写失败）与
+        /// InvalidOperationException（端口重建竞态）交替出现，两次判定的文本都不同，
+        /// 节流会被逐条绕过，因此这里按时间做全局节流。
+        /// </summary>
+        private void ReportDeviceError(string text)
+        {
+            DateTime now = DateTime.UtcNow;
+            lock (_errorLock)
+            {
+                if (now - _lastErrorAt < ErrorReportInterval) return;
+                _lastErrorAt = now;
+            }
+            Post(() => DeviceError?.Invoke(this, text));
+        }
 
         /// <summary>把动作切回 UI 线程执行（后台线程事件回调统一走此入口）。</summary>
         private void Post(Action action) => _syncContext.Post(_ => action(), null);
@@ -299,7 +380,7 @@ namespace SerialPort.Services
     public sealed class SerialPortConfig
     {
         public string PortName { get; set; } = "COM1";
-        public int BaudRate { get; set; } = 9600;
+        public int BaudRate { get; set; } = 115200;
         public DataBits DataBits { get; set; } = DataBits.Eight;
         public StopBits StopBits { get; set; } = System.IO.Ports.StopBits.One;
         public Parity Parity { get; set; } = Parity.None;

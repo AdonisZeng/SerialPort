@@ -36,8 +36,15 @@ namespace SerialPort.Services
         private byte[] _footer;   // 帧尾（null = 未配置）
         private FrameChecksum _checksum;
         private readonly List<byte> _buffer = new List<byte>();   // 当前帧收集缓冲
-        private int _headerMatch;   // 帧头匹配进度（帧头定界模式下等于已匹配字节数）
+        private int _headerMatch;   // 帧头匹配进度（仅帧尾定界模式用；帧头定界模式改用 _partial 候选窗口）
         private bool _inFrame;      // 帧尾定界模式下：已识别帧头（或无帧头时的收集状态）
+        // 帧头定界模式的"候选窗口"：始终是 _header 的一个前缀（长度 0.._header.Length-1）。
+        // 帧头自重叠（如帧头 AA AA 55、帧体出现 AA AA AA 55）时必须对窗口整体回退重扫，
+        // 只回退"当前字节"会漏掉窗口中间的帧头，故不匹配时逐个出队而不是整段丢弃。
+        private readonly List<byte> _partial = new List<byte>();
+
+        /// <summary>单帧收集上限：帧尾 / 下一帧头迟迟不出现时丢弃未完成帧，防止内存无界增长。</summary>
+        private const int MaxFrameBytes = 64 * 1024;
 
         /// <summary>更新帧格式配置并复位解析状态（丢弃未完成帧）。</summary>
         public void Configure(byte[] header, byte[] footer, FrameChecksum checksum)
@@ -52,6 +59,7 @@ namespace SerialPort.Services
         public void Reset()
         {
             _buffer.Clear();
+            _partial.Clear();
             _headerMatch = 0;
             _inFrame = false;
         }
@@ -93,9 +101,11 @@ namespace SerialPort.Services
                     if (EndsWithFooter())
                     {
                         frames.Add(MakeFrame(_buffer.ToArray()));
-                        _buffer.Clear();
-                        _inFrame = false;
+                        Reset();
+                        continue;
                     }
+                    // 帧尾迟迟不出现（配置不当 / 数据流异常）：丢弃未完成帧，重新等待帧头，防止缓冲无界增长
+                    if (_buffer.Count > MaxFrameBytes) Reset();
                     continue;
                 }
 
@@ -143,29 +153,49 @@ namespace SerialPort.Services
         {
             foreach (byte b in data)
             {
-                if (b == _header[_headerMatch])
+                // 候选窗口：新字节追加到窗口末尾后整体重新判定。
+                // 只要窗口不再是帧头前缀，就把队首字节出队并计入帧体（帧尚未开始时丢弃），
+                // 再对剩余窗口继续判定——这样帧头自重叠（帧头 AA AA 55、
+                // 帧体出现 AA AA AA 55）时也不会漏掉窗口中间那个帧头。
+                // 未判定前不能整段丢弃：帧体中与帧头首字节相同的字节会被静默吞掉。
+                _partial.Add(b);
+                while (_partial.Count > 0 && !IsHeaderPrefix())
                 {
-                    _headerMatch++;
-                    if (_headerMatch == _header.Length)
-                    {
-                        // 出现完整帧头：完成上一帧（含其帧头），新帧从当前帧头开始
-                        if (_buffer.Count > 0)
-                        {
-                            frames.Add(MakeFrame(_buffer.ToArray()));
-                            _buffer.Clear();
-                        }
-                        _buffer.AddRange(_header);
-                        _headerMatch = 0;
-                    }
+                    byte dropped = _partial[0];
+                    _partial.RemoveAt(0);
+                    if (_buffer.Count == 0) continue;   // 帧尚未开始：帧头前的孤立字节丢弃
+                    _buffer.Add(dropped);
+                    // 帧头迟迟不出现：丢弃未完成帧，重新等待帧头，防止缓冲无界增长。
+                    // Reset 会清空 _partial，while 条件随之退出，无需额外 break。
+                    if (_buffer.Count > MaxFrameBytes) Reset();
                 }
-                else
-                {
-                    // 部分匹配失败：回退比较当前字节与帧头首字节（重复首字节模式不丢帧头）
-                    _headerMatch = b == _header[0] ? 1 : 0;
-                    if (_buffer.Count > 0) _buffer.Add(b);   // 帧收集进行中：计入帧体
-                    // 尚未开始帧：孤立字节直接丢弃
-                }
+
+                // 窗口凑满即完整帧头（单字节帧头在本次迭代内立即成帧）
+                if (_partial.Count == _header.Length) StartNewFrame(frames);
             }
+        }
+
+        /// <summary>当前候选窗口是否仍是帧头的前缀（出队回退的基础判定）。
+        /// 前置条件：处理完每个字节后窗口长度恒 &lt; _header.Length，故此处 _header[i] 不会越界。</summary>
+        private bool IsHeaderPrefix()
+        {
+            for (int i = 0; i < _partial.Count; i++)
+                if (_partial[i] != _header[i]) return false;
+            return true;
+        }
+
+        /// <summary>完整帧头已识别：完成上一帧（含其帧头），新帧从当前帧头开始。
+        /// 候选窗口即新帧头本身，直接丢弃。</summary>
+        private void StartNewFrame(List<Frame> frames)
+        {
+            if (_buffer.Count > 0)
+            {
+                frames.Add(MakeFrame(_buffer.ToArray()));
+                _buffer.Clear();
+            }
+            _buffer.AddRange(_header);
+            _partial.Clear();
+            _headerMatch = 0;
         }
 
         // ============ 帧构造与校验 ============

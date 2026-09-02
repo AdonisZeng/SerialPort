@@ -5,7 +5,7 @@
   </Profiles>
   <Settings>
     <Setting Name="LastBaudRate" Type="System.Int32" Scope="User">
-      <Value Profile="(Default)">9600</Value>
+      <Value Profile="(Default)">115200</Value>
     </Setting>
     <Setting Name="LastSavePath" Type="System.String" Scope="User">
       <Value Profile="(Default)" />

@@ -21,6 +21,9 @@ namespace SerialPort
     /// </summary>
     public partial class MainWindow : Window
     {
+        /// <summary>默认波特率（无历史记录时使用）。</summary>
+        private const int DefaultBaudRate = 115200;
+
         private readonly SerialPortService _service = new SerialPortService();
         private readonly UpdateService _updateService = new UpdateService();
         private readonly DispatcherTimer _timerPortCheck = new DispatcherTimer();
@@ -29,6 +32,7 @@ namespace SerialPort
         private bool _awaitingDevice;    // 已检测到设备拔出、正在等待重新插入（期间冻结端口列表）
         private int _reconnectFailures;  // 连续重连失败次数（达到阈值后状态栏提示一次）
         private FrameParserWindow _frameWindow;   // 帧解析窗口（非空 = 打开中，接收数据喂入）
+        private QuickCommandWindow _quickWindow;  // 快捷指令窗口（单实例：多开时各自的命令列表会互相覆盖）
         private bool _loadingSettings;   // 构造函数恢复配置期间抑制即时保存（控件赋值会触发变更事件）
         private long _receivedBytesTotal;
         private long _sentBytesTotal;   // 累计发送字节数
@@ -74,21 +78,24 @@ namespace SerialPort
 
             _loadingSettings = true;   // 配置恢复期间抑制即时保存（控件赋值会触发变更事件）
 
-            // 文件保存：优先恢复上次路径，否则使用"我的文档"
+            // 文件保存：优先恢复上次路径，否则使用桌面
             string lastSavePath = Properties.Settings.Default.LastSavePath;
             txtSavePath.Text = !string.IsNullOrWhiteSpace(lastSavePath)
                 ? lastSavePath
-                : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+                : GetDefaultSavePath();
+
+            // 启动后台端口扫描线程（内部会先同步取一次初始列表）；此后不再在 UI 线程枚举端口
+            StartPortScan();
 
             // 串口列表（初始填充不提示；运行期由定时器自动检测变化）
-            RefreshPortList(SerialPortService.GetAvailablePorts(), false);
+            RefreshPortList(GetLastPorts(), false);
 
             // 波特率：固定速率 + Custom（可编辑输入任意值）
             cboBaudRate.Items.Clear();
             cboBaudRate.Items.Add("Custom");
             foreach (int rate in SerialPortService.StandardBaudRates)
                 cboBaudRate.Items.Add(rate);
-            cboBaudRate.SelectedItem = 9600;
+            cboBaudRate.SelectedItem = DefaultBaudRate;
 
             // 加载上次关闭前保存的波特率（Custom 数值也能恢复）
             int lastBaudRate = Properties.Settings.Default.LastBaudRate;
@@ -152,6 +159,7 @@ namespace SerialPort
             // 订阅服务事件（服务在 UI 线程构造，事件回调已在 UI 线程，可直接操作控件）
             _service.DataReceived += OnDataReceived;
             _service.ConnectionChanged += OnConnectionChanged;
+            _service.DeviceError += OnDeviceError;   // 设备异常（拔出 / IO 错误 / 超时）→ 状态栏提示
 
             // 订阅更新服务事件；启动时后台检查一次新版本（不阻塞界面）
             _updateService.CheckCompleted += OnUpdateCheckCompleted;
@@ -161,7 +169,8 @@ namespace SerialPort
 
             Closed += (s, e) =>
             {
-                _timerPortCheck.Stop();       // 停止端口轮询
+                _portScanStopped = true;      // 停止后台端口扫描线程
+                _timerPortCheck.Stop();       // 停止端口检测
                 _timerStats.Stop();           // 停止统计刷新
                 _timerSending = false;        // 停止定时发送（后台线程随进程退出）
                 DisposeSaveWriter();          // 关闭保存文件（排空队列后释放）
@@ -183,6 +192,9 @@ namespace SerialPort
 
             _loadingSettings = false;
 
+            // 主题可能在 App.OnStartup 中已从设置恢复为深色，校准按钮文案（XAML 初始文案恒为"深色模式"）
+            UpdateThemeButtonText();
+
             UpdateStatus("就绪");
         }
 
@@ -191,7 +203,8 @@ namespace SerialPort
         // ============================================================
         private void TimerPortCheck_Tick(object sender, EventArgs e)
         {
-            string[] ports = SerialPortService.GetAvailablePorts();
+            // 端口枚举已移到后台扫描线程，这里只读快照：避免每 0.5 秒在 UI 线程做同步 I/O
+            string[] ports = GetLastPorts();
 
             if (_service.IsConnected)
             {
@@ -243,7 +256,73 @@ namespace SerialPort
         {
             // 等待重插期间冻结列表：不刷新，避免重建列表丢失选中项
             if (_awaitingDevice) return;
-            RefreshPortList(SerialPortService.GetAvailablePorts());
+
+            string[] ports = GetLastPorts();
+            if (!PortListEquals(ports))
+            {
+                RefreshPortList(ports);   // 集合有变化：走常规重建（下拉刚弹出，尚未真正展开）
+                return;
+            }
+            // 集合未变：可能上次描述查询被跳过（展开中 / 结果过期），此处补一次回填。
+            // 回填走"就地替换单个 Item"，对已展开的下拉是安全的。
+            // 必须以"上次补查时的集合"去重：某些端口在 WMI 中确实没有描述时
+            // HasMissingDescription() 恒为 true，不去重会导致每次展开下拉都重跑一次 WMI 查询，
+            // 而查回来的结果完全相同、全部被丢弃。
+            if (!HasMissingDescription() || PortListEquals(_lastBackfillPorts)) return;
+            _lastBackfillPorts = ports;
+            ScheduleDescriptionBackfill(ports);
+        }
+
+        // ============ 端口枚举（后台扫描线程） ============
+
+        /// <summary>
+        /// 端口扫描周期。注意与 UI 的 _timerPortCheck（0.5 秒）相位独立：
+        /// 快照最多滞后一轮 + tick 最多滞后一轮，端口变化到 UI 反映最坏约"扫描间隔 + 0.5 秒"。
+        /// 后台枚举代价很低（一次注册表查询），取 200 毫秒把最坏延迟从约 1 秒压回约 0.7 秒。
+        /// </summary>
+        private static readonly TimeSpan PortScanInterval = TimeSpan.FromMilliseconds(200);
+
+        // 后台扫描线程的端口快照（后台写、UI 读）
+        private readonly object _portsLock = new object();
+        private string[] _lastPorts = new string[0];
+        private volatile bool _portScanStopped;   // 关窗后置位，扫描线程随进程退出
+
+        // 上次为哪个端口集合补查过设备描述（下拉补查去重：端口在 WMI 中确实无描述时
+        // HasMissingDescription() 恒为 true，不去重会导致每次展开下拉都重跑一次 WMI 查询）
+        private string[] _lastBackfillPorts = new string[0];
+
+        /// <summary>读取最近一次扫描到的端口列表（返回副本，调用方在 UI 线程使用）。</summary>
+        private string[] GetLastPorts()
+        {
+            lock (_portsLock) return (string[])_lastPorts.Clone();
+        }
+
+        /// <summary>启动后台端口扫描线程：枚举串口涉及注册表查询，放在 UI 线程会周期性卡顿。</summary>
+        private void StartPortScan()
+        {
+            // 先同步取一次，保证构造函数中的首次 RefreshPortList 有数据
+            string[] initial = SerialPortService.GetAvailablePorts();
+            lock (_portsLock) _lastPorts = initial;
+
+            var thread = new Thread(PortScanLoop) { IsBackground = true };
+            thread.Start();
+        }
+
+        private void PortScanLoop()
+        {
+            while (!_portScanStopped)
+            {
+                try
+                {
+                    string[] ports = SerialPortService.GetAvailablePorts();
+                    lock (_portsLock) _lastPorts = ports;
+                }
+                catch
+                {
+                    // 枚举失败（极罕见）：保留上一次快照，下轮重试，后台线程不留下未处理异常
+                }
+                Thread.Sleep(PortScanInterval);
+            }
         }
 
         private void RefreshPortList(string[] ports, bool notify = true)
@@ -251,7 +330,7 @@ namespace SerialPort
             if (PortListEquals(ports)) return;   // 集合无变化：不动列表，也不触发描述查询
 
             // 先以纯端口号占位重建（列表立即反映真实端口，描述查询完成后回填）
-            RebuildPortItems(ports, null);
+            RebuildPortItems(ports);
 
             if (notify) UpdateStatus("检测到端口变化，已更新列表");
 
@@ -261,32 +340,68 @@ namespace SerialPort
         /// <summary>
         /// 异步查询设备描述；完成后切回 UI 线程回填。
         /// 集合再次变化时丢弃本次结果（不直接触发新查询），由下轮 tick 自然补查——收敛无循环。
+        /// 回填走 <see cref="ApplyDescriptionsInPlace"/>（就地替换单个 Item），
+        /// 因此下拉处于展开状态时也能安全执行，不会像 RebuildPortItems 那样清空重建。
         /// </summary>
         private void ScheduleDescriptionBackfill(string[] ports)
         {
             Task.Run(() => PortDeviceInfo.GetDescriptions()).ContinueWith(t =>
             {
+                // 先判故障：直接读 t.Result 会在任务异常时抛 AggregateException，
+                // 且该异常无人观察（ContinueWith 的返回任务被丢弃），等于静默吞错
+                if (t.IsFaulted || t.IsCanceled || t.Result == null) return;
                 if (!PortListEquals(ports)) return;   // 集合已变化：丢弃本次结果
-                RebuildPortItems(ports, t.Result);
+                ApplyDescriptionsInPlace(t.Result);
             }, TaskScheduler.FromCurrentSynchronizationContext());
         }
 
         /// <summary>
-        /// 重建端口下拉框 Items（SerialPortItem 列表）。
+        /// 就地回填设备描述：仅替换描述确有变化的项，不动列表结构与选中项。
+        /// 下拉展开时 Clear + 重建会导致下拉重绘 / 高亮丢失，故普通回填一律走这里。
+        /// </summary>
+        private void ApplyDescriptionsInPlace(Dictionary<string, string> descriptions)
+        {
+            if (descriptions == null || descriptions.Count == 0) return;
+
+            int selected = cboPortName.SelectedIndex;
+            for (int i = 0; i < cboPortName.Items.Count; i++)
+            {
+                var item = cboPortName.Items[i] as SerialPortItem;
+                if (item == null) continue;
+                string desc;
+                if (!descriptions.TryGetValue(item.PortName, out desc)) continue;
+                if (desc == item.Description) continue;   // 无变化：不触碰该项
+                cboPortName.Items[i] = new SerialPortItem(item.PortName, desc);
+            }
+            // 就地替换会清掉选中，按原下标恢复
+            if (selected >= 0 && selected < cboPortName.Items.Count) cboPortName.SelectedIndex = selected;
+        }
+
+        /// <summary>是否存在尚未补上设备描述的端口项（用于下拉展开时判断是否值得再查一次）。</summary>
+        private bool HasMissingDescription()
+        {
+            foreach (object o in cboPortName.Items)
+            {
+                var item = o as SerialPortItem;
+                if (item != null && string.IsNullOrEmpty(item.Description)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 重建端口下拉框 Items（SerialPortItem 列表）：先以纯端口号占位，
+        /// 设备描述由 <see cref="ScheduleDescriptionBackfill"/> 查完后经
+        /// <see cref="ApplyDescriptionsInPlace"/> 就地回填。
         /// 选中恢复规则：优先保留当前选中（用户可能已手动改选）；
         /// 失效且未连接时选第一个 / 清空；已连接（端口仍在列表中）不强制改选。
         /// </summary>
-        private void RebuildPortItems(string[] ports, Dictionary<string, string> descriptions)
+        private void RebuildPortItems(string[] ports)
         {
             string keep = (cboPortName.SelectedItem as SerialPortItem)?.PortName;
 
             cboPortName.Items.Clear();
             foreach (string port in ports)
-            {
-                string desc = null;
-                if (descriptions != null) descriptions.TryGetValue(port, out desc);
-                cboPortName.Items.Add(new SerialPortItem(port, desc));
-            }
+                cboPortName.Items.Add(new SerialPortItem(port, null));
 
             int keepIndex = keep != null ? Array.IndexOf(ports, keep) : -1;
             if (keepIndex >= 0)
@@ -354,6 +469,12 @@ namespace SerialPort
             }
         }
 
+        /// <summary>
+        /// 设备异常提示（服务已节流：同一文本 2 秒内最多一次）。
+        /// 只写状态栏不弹窗：串口高频收发时错误可能每秒成百上千次，弹窗会刷屏。
+        /// </summary>
+        private void OnDeviceError(object sender, string message) => UpdateStatus(message);
+
         private void OnConnectionChanged(object sender, bool connected)
         {
             // 连接状态由按钮文字（打开/关闭串口）与颜色（绿/红）体现；
@@ -383,9 +504,14 @@ namespace SerialPort
         private void BtnThemeToggle_Click(object sender, RoutedEventArgs e)
         {
             ThemeManager.Toggle();
-            btnThemeToggle.Content = ThemeManager.Current == ThemeMode.Dark ? "浅色模式" : "深色模式";
+            UpdateThemeButtonText();
             SaveSettings();   // 主题持久化：立即保存，下次启动恢复
         }
+
+        /// <summary>把主题按钮文案同步到当前主题（按钮显示的是"切换后"的目标主题）。
+        /// 启动时 App.OnStartup 可能已恢复深色主题，而 XAML 里的初始文案恒为"深色模式"，必须校准。</summary>
+        private void UpdateThemeButtonText() =>
+            btnThemeToggle.Content = ThemeManager.Current == ThemeMode.Dark ? "浅色模式" : "深色模式";
 
         /// <summary>编码下拉切换：重建对应状态保持 Decoder（从干净状态开始），发送编码联动。</summary>
         private void CboEncoding_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
@@ -552,11 +678,13 @@ namespace SerialPort
         /// <summary>
         /// 接收显示与筛选缓冲的容量上限（字符数）：超出后截掉头部等量内容。
         /// WPF TextBox 整段存储文本且 AppendText 随文本增长越来越慢，必须设上限防止内存无界增长。
+        /// 取值说明：接收区开了 TextWrapping，截头时 txtReceive.Text = Substring(...) 会整段重建并触发
+        /// 重新排版，百万字符量级下单次操作可冻结 UI 数秒；20 万字符兼顾历史回溯与流畅度。
         /// </summary>
-        private const int MaxReceiveChars = 1_000_000;
+        private const int MaxReceiveChars = 200_000;
 
         /// <summary>截断余量：计数超过"上限 + 余量"才截头，避免高频接收时每块都触发全量拷贝。</summary>
-        private const int TrimKeepMargin = 200_000;
+        private const int TrimKeepMargin = 50_000;
 
         /// <summary>接收区（及筛选 Buffer）超过容量上限时截头，保持内存有界。</summary>
         private void TrimReceiveIfNeeded()
@@ -667,15 +795,14 @@ namespace SerialPort
                 if (chkSendHex.IsChecked == true)
                 {
                     byte[] bytes = HexStringToBytes(text);
-                    _service.SendBytes(bytes);
-                    _sentBytesTotal += bytes.Length;
+                    // 只在真正写出时累计：设备拔出等待重连期间数据被丢弃，不应计入发送统计
+                    if (_service.SendBytes(bytes)) _sentBytesTotal += bytes.Length;
                     AppendLocalEcho(FormatHex(bytes));
                 }
                 else
                 {
                     byte[] bytes = _textEncoding.GetBytes(text);   // 编码一次：字节数直接取自数组，不再二次 GetByteCount
-                    _service.SendBytes(bytes);
-                    _sentBytesTotal += bytes.Length;
+                    if (_service.SendBytes(bytes)) _sentBytesTotal += bytes.Length;
                     AppendLocalEcho(text);
                 }
                 return true;
@@ -690,11 +817,25 @@ namespace SerialPort
 
         private void BtnClearSend_Click(object sender, RoutedEventArgs e) => txtSend.Clear();
 
-        /// <summary>打开快捷指令窗口（非模态：发送指令时不阻塞主窗口操作）。</summary>
+        /// <summary>
+        /// 打开快捷指令窗口（非模态：发送指令时不阻塞主窗口操作）。
+        /// 单实例：窗口各自持有独立的命令列表副本，保存是"全量覆盖写"，
+        /// 多开时后保存的窗口会覆盖另一窗口的修改，造成命令丢失。
+        /// </summary>
         private void BtnQuickCommands_Click(object sender, RoutedEventArgs e)
         {
-            var wnd = new QuickCommandWindow(this);
-            wnd.Show();
+            if (_quickWindow == null)
+            {
+                _quickWindow = new QuickCommandWindow(this);
+                _quickWindow.Owner = this;   // 设所有者：主窗口关闭时子窗口随之关闭，进程才能正常退出
+                _quickWindow.Closed += (s, args) => _quickWindow = null;
+            }
+            if (_quickWindow.IsVisible)
+            {
+                _quickWindow.Activate();
+                return;
+            }
+            _quickWindow.Show();
         }
 
         // ============================================================
@@ -837,7 +978,9 @@ namespace SerialPort
             {
                 int limit = _searchIndex < 0 ? text.Length : _searchIndex;
                 idx = FindMatchIndexBackward(text, term, limit, matchCase, wholeWord);
-                if (idx < 0 && limit > 0)
+                // 环绕条件用 _searchIndex >= 0（而非 limit > 0）：已在首个匹配处（_searchIndex == 0）
+                // 时 limit 为 0，用 limit > 0 判断会漏掉环绕，误报"未找到匹配项"
+                if (idx < 0 && _searchIndex >= 0)
                     idx = FindMatchIndexBackward(text, term, text.Length, matchCase, wholeWord);   // 环绕
             }
             else
@@ -1037,13 +1180,21 @@ namespace SerialPort
             if (!_loadingSettings) SaveSettings();
         }
 
-        /// <summary>在保存路径下以默认文件名（年月日时分秒）新建文件；路径为空时回退到"我的文档"。</summary>
+        /// <summary>默认文件保存路径：桌面；桌面不可用时回退到"我的文档"。</summary>
+        private static string GetDefaultSavePath()
+        {
+            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+            if (!string.IsNullOrWhiteSpace(desktop)) return desktop;
+            return Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        }
+
+        /// <summary>在保存路径下以默认文件名（年月日时分秒）新建文件；路径为空时回退到桌面。</summary>
         private void StartSaveFile()
         {
             string dir = txtSavePath.Text.Trim();
             if (string.IsNullOrEmpty(dir))
             {
-                dir = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+                dir = GetDefaultSavePath();
                 txtSavePath.Text = dir;
             }
             string name = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".txt";

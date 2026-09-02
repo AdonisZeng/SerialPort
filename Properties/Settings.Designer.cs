@@ -29,7 +29,7 @@ namespace SerialPort.Properties
 
         [global::System.Configuration.UserScopedSettingAttribute()]
         [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
-        [global::System.Configuration.DefaultSettingValueAttribute("9600")]
+        [global::System.Configuration.DefaultSettingValueAttribute("115200")]
         public int LastBaudRate
         {
             get { return ((int)(this["LastBaudRate"])); }
