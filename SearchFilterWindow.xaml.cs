@@ -62,8 +62,10 @@ namespace SerialPort
                 txtStatus.Text = "请输入查找内容。";
                 return;
             }
-            bool found = _main.Find(term, chkMatchCase.IsChecked == true, chkWholeWord.IsChecked == true, backward);
-            txtStatus.Text = found ? string.Empty : "未找到匹配项。";
+            SerialPort.UI.FindResult result = _main.Find(term, chkMatchCase.IsChecked == true, chkWholeWord.IsChecked == true, backward);
+            txtStatus.Text = !result.Found
+                ? "未找到匹配项。"
+                : $"第 {result.Current} / 共 {result.Total} 处匹配";
         }
 
         private void ApplyFilter()

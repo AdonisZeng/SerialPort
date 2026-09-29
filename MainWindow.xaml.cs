@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -54,23 +55,39 @@ namespace SerialPort
         private Encoding _textEncoding = Encoding.UTF8;
         private Decoder _textDecoder = Encoding.UTF8.GetDecoder();
 
-        // 暂停显示缓冲：暂停期间累积显示文本（上限保护），恢复时一次性补齐
-        private readonly StringBuilder _pausedBuffer = new StringBuilder();
+        // 接收区行集合（虚拟化 ListBox 数据源）：FIFO 截头 = 集合头部批量移除，不再触发全文重排
+        private readonly ReceiveLineCollection _receiveLines = new ReceiveLineCollection();
+        private ReceiveLine _pendingItem;   // 显示集合中对应"未完成行"的实时条目（null = 当前无未完成行显示）
+
+        // 跨块行组装器：接收数据不按行对齐，按 \r\n / \r / \n 分行后逐行进管线
+        private readonly ReceiveLineAssembler _assembler = new ReceiveLineAssembler();
+
+        // 单块数据完成的行批次：块尾一次性入集合（整批一个集合通知，避免高频数据下海量事件）
+        private readonly List<string> _batchLines = new List<string>();
+
+        // 暂停显示缓冲：暂停期间行进暂停缓冲（上限保护），恢复时一次性入集合
+        private List<ReceiveLine> _pausedLines = new List<ReceiveLine>();
+        private int _pausedChars;               // 暂停缓冲字符合计（容量核算）
+        private ReceiveLine _pausedPendingItem; // 暂停缓冲中对应"未完成行"的实时条目
+
+        // 未完成行的待保存片段：行完成时拼在行文本前写盘，保证文件内容与接收顺序一致
+        private string _saveCarry = string.Empty;
 
         // 搜索状态（接收区查找）
         private string _searchTerm;
         private bool _searchMatchCase;
         private bool _searchWholeWord;
-        private int _searchIndex = -1;          // 最近一次匹配的起始下标；-1 = 无
+        private SearchPos _searchPos;   // 当前匹配位置（行引用 + 行内第几个匹配）；null = 无
+
+        /// <summary>当前匹配位置（存行对象引用而非下标：头部截头后经 IndexOf 校验，失效自动复位）。</summary>
+        private sealed class SearchPos
+        {
+            public ReceiveLine Line;
+            public int Occurrence;
+        }
 
         // 筛选状态（_filterState 非空表示筛选已启用）
         private FilterState _filterState;
-
-        // 时间戳显示状态（状态机始终运行，与复选框勾选状态无关）
-        private bool _atLineStart = true;   // 当前处于行首（下一个非换行字符应补时间戳）
-
-        // 接收区显示文本字符数（与 txtReceive.Text 同步维护，避免每块数据 O(n) 读 Length）
-        private int _receiveTextLength;
 
         public MainWindow()
         {
@@ -161,6 +178,11 @@ namespace SerialPort
             _service.ConnectionChanged += OnConnectionChanged;
             _service.DeviceError += OnDeviceError;   // 设备异常（拔出 / IO 错误 / 超时）→ 状态栏提示
 
+            // 接收管线：组装器产出完整行 → 批量入虚拟化集合
+            _assembler.LineCompleted += OnAssemblerLineCompleted;
+            _assembler.PendingUpdated += OnAssemblerPendingUpdated;
+            lstReceive.ItemsSource = _receiveLines;
+
             // 订阅更新服务事件；启动时后台检查一次新版本（不阻塞界面）
             _updateService.CheckCompleted += OnUpdateCheckCompleted;
             _updateService.UpdateError += OnUpdateError;
@@ -173,6 +195,7 @@ namespace SerialPort
                 _timerPortCheck.Stop();       // 停止端口检测
                 _timerStats.Stop();           // 停止统计刷新
                 _timerSending = false;        // 停止定时发送（后台线程随进程退出）
+                FlushPendingLineForSave();    // 未完成行写入保存文件，避免关窗丢尾巴
                 DisposeSaveWriter();          // 关闭保存文件（排空队列后释放）
                 _service.Dispose();           // 关闭串口并释放资源（Dispose 幂等）
                 SaveSettings();               // 正常关闭：统一保存所有持久化配置
@@ -194,6 +217,7 @@ namespace SerialPort
 
             // 主题可能在 App.OnStartup 中已从设置恢复为深色，校准按钮文案（XAML 初始文案恒为"深色模式"）
             UpdateThemeButtonText();
+            UpdateSearchHighlightBrush();   // 搜索高亮色按当前主题取资源（主题切换时再次刷新）
 
             UpdateStatus("就绪");
         }
@@ -505,6 +529,7 @@ namespace SerialPort
         {
             ThemeManager.Toggle();
             UpdateThemeButtonText();
+            UpdateSearchHighlightBrush();   // 高亮色随主题切换（可继承附加属性传播到所有行容器）
             SaveSettings();   // 主题持久化：立即保存，下次启动恢复
         }
 
@@ -547,8 +572,18 @@ namespace SerialPort
         }
 
         // ============================================================
-        // 数据接收
+        // 数据接收（跨块行组装 → 批量入虚拟化集合 → FIFO 截头）
         // ============================================================
+
+        /// <summary>
+        /// 显示集合 / 筛选缓冲 / 暂停缓冲共用的容量上限（字符数）。超限后从头部整行移除（FIFO），
+        /// 虚拟化列表只重建受影响行，不再像旧版 TextBox 截头那样整段重建 + TextWrapping 全文重排冻结 UI。
+        /// </summary>
+        private const int MaxReceiveChars = 200_000;
+
+        /// <summary>截断余量：超过"上限 + 余量"才批量截头，避免高频接收时每块都触发移除。</summary>
+        private const int TrimKeepMargin = 50_000;
+
         private void OnDataReceived(object sender, DataReceivedEventArgs e)
         {
             if (e.Data == null || e.Data.Length == 0) return;
@@ -558,162 +593,17 @@ namespace SerialPort
 
             _receivedBytesTotal += e.Data.Length;
 
-            string increment = GetTimestampedText(GetIncrementText(e.Data));
-            AppendDisplayText(increment);
+            // 跨块行组装：完整行经回调进批次；块尾 PendingUpdated 统一入集合（整批一个集合通知）
+            _assembler.Append(GetIncrementText(e.Data));
+
+            // 未完成行超限截头（无换行的持续数据流防无界增长；截掉的头部不再进显示与文件）
+            _assembler.TrimPendingIfNeeded(MaxReceiveChars + TrimKeepMargin, MaxReceiveChars);
+
+            if (chkAutoScroll.IsChecked == true && _receiveLines.Count > 0)
+                lstReceive.ScrollIntoView(_receiveLines[_receiveLines.Count - 1]);
         }
 
-        /// <summary>1 秒统计刷新：累计接收/发送字节、双向实时速率、连接时长（UI 线程定时器）。</summary>
-        private void TimerStats_Tick(object sender, EventArgs e)
-        {
-            long rx = _receivedBytesTotal;
-            long tx = _sentBytesTotal;
-            double rxKb = (rx - _lastStatsRx) / 1024.0;
-            double txKb = (tx - _lastStatsTx) / 1024.0;
-            _lastStatsRx = rx;
-            _lastStatsTx = tx;
-            string duration = _service.IsConnected
-                ? DateTime.Now.Subtract(_connectStartedAt).ToString(@"hh\:mm\:ss")
-                : "--:--:--";
-            txtStats.Text = $"累计收 {rx} B / 发 {tx} B　|　↓ {rxKb:F1} KB/s　↑ {txKb:F1} KB/s　|　连接 {duration}";
-        }
-
-        /// <summary>
-        /// 统一追加显示文本：筛选缓冲 / 容量截断 / 文件保存 / 自动滚动（接收数据与本地回显共用）。
-        /// 暂停显示时仅累积与写文件，不刷新接收区，恢复时一次性补齐。
-        /// </summary>
-        private void AppendDisplayText(string increment)
-        {
-            if (chkPauseReceive.IsChecked == true)
-            {
-                // 暂停：数据仍记入筛选缓冲与保存文件，仅不刷新接收区
-                if (_filterState != null) _filterState.Buffer.Append(increment);
-                _pausedBuffer.Append(increment);
-                TrimPausedBuffer();
-                TrimReceiveIfNeeded();   // 暂停期间筛选 Buffer 同样截头，防止长时间暂停内存无界
-                EnqueueSaveText(increment);
-                return;
-            }
-
-            if (_filterState != null)
-            {
-                // 筛选启用：完整文本记入缓冲，接收区只追加符合筛选条件的行
-                _filterState.Buffer.Append(increment);
-                AppendFiltered(increment);
-            }
-            else
-            {
-                // 增量追加（WPF 下全量重赋 Text 会重建整个文本，大数据量时卡顿）
-                txtReceive.AppendText(increment);
-                _receiveTextLength += increment.Length;
-            }
-
-            // 接收区与筛选缓冲容量上限：超限截头，防止长时运行内存无界增长
-            TrimReceiveIfNeeded();
-
-            // 勾选"文件保存"时把同样的内容写入文件（后台队列写盘，不阻塞 UI 线程）
-            EnqueueSaveText(increment);
-
-            if (chkAutoScroll.IsChecked == true)
-                txtReceive.ScrollToEnd();
-        }
-
-        /// <summary>暂停缓冲上限截头（与接收区同量级，防止长时间暂停内存无界增长）。</summary>
-        private void TrimPausedBuffer()
-        {
-            if (_pausedBuffer.Length > MaxReceiveChars + TrimKeepMargin)
-                _pausedBuffer.Remove(0, _pausedBuffer.Length - MaxReceiveChars);
-        }
-
-        /// <summary>暂停显示开关：勾选暂停刷新，取消时一次性补齐暂停期间的数据。</summary>
-        private void ChkPauseReceive_Changed(object sender, RoutedEventArgs e)
-        {
-            if (chkPauseReceive.IsChecked == true)
-            {
-                UpdateStatus("接收显示已暂停，数据继续接收中");
-            }
-            else
-            {
-                ResumeDisplay();
-                UpdateStatus("已恢复接收显示");
-            }
-            if (!_loadingSettings) SaveSettings();
-        }
-
-        /// <summary>恢复显示：把暂停期间累积的文本一次性追加（筛选模式按行过滤，Buffer 已记录不重复）。</summary>
-        private void ResumeDisplay()
-        {
-            if (_pausedBuffer.Length == 0) return;
-            string pending = _pausedBuffer.ToString();
-            _pausedBuffer.Clear();
-
-            if (_filterState != null)
-                AppendFiltered(pending);   // 逐行过滤追加显示（Buffer 在暂停期间已同步记录）
-            else
-            {
-                txtReceive.AppendText(pending);
-                _receiveTextLength += pending.Length;
-                TrimReceiveIfNeeded();
-            }
-            if (chkAutoScroll.IsChecked == true)
-                txtReceive.ScrollToEnd();
-        }
-
-        /// <summary>字节数组转 "AA BB CC" 形式（本地回显 hex 模式用）。</summary>
-        private static string FormatHex(byte[] bytes)
-        {
-            var sb = new StringBuilder(bytes.Length * 3);
-            foreach (byte b in bytes)
-                sb.Append(b.ToString("X2")).Append(' ');
-            return sb.ToString().TrimEnd();
-        }
-
-        /// <summary>本地回显：勾选后把发送内容以 [TX] 前缀追加到接收区（与接收数据同管线，含时间戳）。</summary>
-        private void AppendLocalEcho(string content)
-        {
-            if (chkLocalEcho.IsChecked != true) return;
-            // 行尾去掉追加的换行再补 \r\n：回显内容自成一行；经 GetTimestampedText 保持行首状态机一致
-            AppendDisplayText(GetTimestampedText("[TX] " + content.TrimEnd('\r', '\n') + "\r\n"));
-        }
-
-        /// <summary>
-        /// 接收显示与筛选缓冲的容量上限（字符数）：超出后截掉头部等量内容。
-        /// WPF TextBox 整段存储文本且 AppendText 随文本增长越来越慢，必须设上限防止内存无界增长。
-        /// 取值说明：接收区开了 TextWrapping，截头时 txtReceive.Text = Substring(...) 会整段重建并触发
-        /// 重新排版，百万字符量级下单次操作可冻结 UI 数秒；20 万字符兼顾历史回溯与流畅度。
-        /// </summary>
-        private const int MaxReceiveChars = 200_000;
-
-        /// <summary>截断余量：计数超过"上限 + 余量"才截头，避免高频接收时每块都触发全量拷贝。</summary>
-        private const int TrimKeepMargin = 50_000;
-
-        /// <summary>接收区（及筛选 Buffer）超过容量上限时截头，保持内存有界。</summary>
-        private void TrimReceiveIfNeeded()
-        {
-            // 筛选模式：Buffer 记录全量文本，增长快于显示（不匹配行不进显示），须独立检查截头
-            if (_filterState != null)
-            {
-                int bufferLength = _filterState.Buffer.Length;
-                if (bufferLength > MaxReceiveChars + TrimKeepMargin)
-                    _filterState.Buffer.Remove(0, bufferLength - MaxReceiveChars);
-            }
-
-            if (_receiveTextLength <= MaxReceiveChars + TrimKeepMargin) return;
-
-            // 只在截断时读一次实际长度（频率低），防御计数漂移
-            int actualLength = txtReceive.Text.Length;
-            if (actualLength <= MaxReceiveChars)
-            {
-                _receiveTextLength = actualLength;   // 计数漂移：校准
-                return;
-            }
-
-            int remove = actualLength - MaxReceiveChars;
-            txtReceive.Text = txtReceive.Text.Substring(remove);   // 截头：保留最新数据
-            _receiveTextLength = actualLength - remove;
-            _searchIndex = _searchIndex < 0 ? -1 : Math.Max(-1, _searchIndex - remove);   // 搜索下标随截断前移
-        }
-
-        /// <summary>计算本次接收数据对应的显示文本（hex 模式每字节 "XX " 加换行，文本模式为 UTF-8 解码结果）。</summary>
+        /// <summary>计算本次接收数据对应的文本（hex 模式每字节 "XX " 一行，文本模式为状态保持解码结果）。</summary>
         private string GetIncrementText(byte[] data)
         {
             if (chkReceiveHex.IsChecked == true)
@@ -733,37 +623,302 @@ namespace SerialPort
         }
 
         /// <summary>
-        /// 给单次接收的增量文本补时间戳：每行行首加 [HH:mm:ss]。
-        /// 行以 \n、\r、\r\n（含跨块拆分的 \r+ 开头\n）终结；空行不加戳；
-        /// 仅当勾选"时间戳显示"时输出前缀，行首位置跟踪始终进行。
+        /// 行格式化统一入口：行文本 = (时间戳) + (方向前缀) + 内容。
+        /// 勾选"本地回显"时接收行加 [RX]、发送回显加 [TX]（均位于时间戳之后）；空行不加任何前缀。
         /// </summary>
-        private string GetTimestampedText(string increment)
+        private string FormatLine(string content, bool isTx)
         {
-            // 未勾选时无需构造输出：行首状态只取决于块尾字符（块中间的换行不影响块尾是否处于行首），
-            // 空块保持原状态，直接返回原文
-            if (chkTimestamp.IsChecked != true)
+            if (string.IsNullOrEmpty(content)) return string.Empty;
+            var sb = new StringBuilder(content.Length + 24);
+            if (chkTimestamp.IsChecked == true)
+                sb.Append('[').Append(DateTime.Now.ToString("HH:mm:ss")).Append("] ");
+            if (chkLocalEcho.IsChecked == true)
+                sb.Append(isTx ? "[TX] " : "[RX] ");
+            sb.Append(content);
+            return sb.ToString();
+        }
+
+        /// <summary>组装器回调：一行完成 → 写盘 + 进批次（批次在块尾统一入集合）。</summary>
+        private void OnAssemblerLineCompleted(string line)
+        {
+            EmitCompletedLine(line, false);
+        }
+
+        /// <summary>
+        /// 完整行入管线：保存 + 加入行批次。接收行会把"未完成行待保存片段"（_saveCarry）拼在行前写入，
+        /// 保证文件内容顺序与真实接收一致；发送回显行独立成行，不消费该片段（片段仍归未完成行）。
+        /// </summary>
+        private void EmitCompletedLine(string line, bool isTx)
+        {
+            string formatted = FormatLine(line, isTx);
+            if (isTx)
+                EnqueueSaveText(formatted + "\r\n");
+            else
             {
-                if (increment.Length > 0)
-                    _atLineStart = IsNewLineChar(increment[increment.Length - 1]);
-                return increment;
+                EnqueueSaveText(_saveCarry + formatted + "\r\n");   // 保存内容与显示一致（含前缀与时间戳）
+                _saveCarry = string.Empty;
+            }
+            _batchLines.Add(formatted);
+        }
+
+        /// <summary>组装器回调：一块数据处理完毕 → 批次入集合 + 同步未完成行显示条目。</summary>
+        private void OnAssemblerPendingUpdated()
+        {
+            FlushBatchLines();
+
+            string formattedPending = FormatLine(_assembler.PendingText, false);
+            _saveCarry = formattedPending;   // 未完成行片段待行完成时拼入文件
+
+            if (chkPauseReceive.IsChecked == true)
+            {
+                // 暂停：未完成行同步到暂停缓冲条目（恢复时随批次一并入集合）
+                if (formattedPending.Length == 0)
+                {
+                    _pausedPendingItem = null;
+                }
+                else if (_pausedPendingItem == null)
+                {
+                    _pausedPendingItem = new ReceiveLine(formattedPending);
+                    PausedAddLine(_pausedPendingItem);
+                }
+                else
+                {
+                    _pausedPendingItem.Text = formattedPending;
+                }
+                TrimPausedLines();
+                return;
             }
 
-            StringBuilder sb = new StringBuilder(increment.Length + 12);
-            bool atLineStart = _atLineStart;
-            DateTime now = DateTime.Now;   // 同一数据块的所有行共享同一时刻（秒级精度下无差别）
-            string stamp = "[" + now.ToString("HH:mm:ss") + "] ";   // 块内不变：循环外格式化一次
-            foreach (char c in increment)
+            if (_filterState != null) return;   // 筛选模式：未完成行不上屏（整行完成并匹配后才显示）
+
+            // 正常模式：未完成行在集合末尾原位更新（数据续到时"长"在同一行，与旧版连续显示一致）
+            if (formattedPending.Length == 0)
             {
-                if (atLineStart && !IsNewLineChar(c))
-                {
-                    sb.Append(stamp);
-                    atLineStart = false;
-                }
-                sb.Append(c);
-                if (IsNewLineChar(c)) atLineStart = true;   // \n / \r（含 \r\n 与单独 \r）终结一行
+                _pendingItem = null;
             }
-            _atLineStart = atLineStart;
-            return sb.ToString();
+            else if (_pendingItem == null)
+            {
+                _pendingItem = _receiveLines.AddLine(formattedPending);
+                TrimDisplay();
+            }
+            else
+            {
+                _receiveLines.SetText(_pendingItem, formattedPending);
+                TrimDisplay();
+            }
+        }
+
+        /// <summary>行批次入显示集合 / 暂停缓冲 / 筛选缓冲（按当前模式分流，整批一次集合通知）。</summary>
+        private void FlushBatchLines()
+        {
+            if (_batchLines.Count == 0) return;
+
+            // 筛选启用时：全量行先记入筛选缓冲（与是否暂停无关，恢复筛选视图需要完整历史）
+            if (_filterState != null)
+            {
+                for (int i = 0; i < _batchLines.Count; i++)
+                    _filterState.Lines.Add(new ReceiveLine(_batchLines[i]));
+                _filterState.CharCount += BatchChars(_batchLines);
+                TrimFilterBuffer();
+            }
+
+            if (chkPauseReceive.IsChecked == true)
+            {
+                for (int i = 0; i < _batchLines.Count; i++)
+                {
+                    if (_pausedPendingItem != null)
+                    {
+                        // 第一行并入未完成行条目（整行替换部分行），保持内容连续
+                        _pausedPendingItem.Text = _batchLines[i];
+                        _pausedPendingItem = null;
+                    }
+                    else
+                    {
+                        PausedAddLine(new ReceiveLine(_batchLines[i]));
+                    }
+                }
+                _batchLines.Clear();
+                TrimPausedLines();
+                return;
+            }
+
+            if (_filterState != null)
+            {
+                // 筛选模式：显示集合只追加匹配行
+                var shown = new List<ReceiveLine>();
+                for (int i = 0; i < _batchLines.Count; i++)
+                    if (MatchesFilter(_batchLines[i])) shown.Add(new ReceiveLine(_batchLines[i]));
+                _receiveLines.AddRange(shown);
+                _batchLines.Clear();
+                TrimDisplay();
+                return;
+            }
+
+            // 正常模式：首行并入未完成行条目（Replace），其余整批追加（单次 Add 通知）
+            if (_pendingItem != null)
+            {
+                _receiveLines.SetText(_pendingItem, _batchLines[0]);
+                _pendingItem = null;
+                if (_batchLines.Count > 1)
+                {
+                    var rest = new List<ReceiveLine>(_batchLines.Count - 1);
+                    for (int i = 1; i < _batchLines.Count; i++)
+                        rest.Add(new ReceiveLine(_batchLines[i]));
+                    _receiveLines.AddRange(rest);
+                }
+            }
+            else
+            {
+                var lines = new List<ReceiveLine>(_batchLines.Count);
+                for (int i = 0; i < _batchLines.Count; i++)
+                    lines.Add(new ReceiveLine(_batchLines[i]));
+                _receiveLines.AddRange(lines);
+            }
+            _batchLines.Clear();
+            TrimDisplay();
+        }
+
+        /// <summary>显示集合容量截头：按字符数从头部移除整行（FIFO，虚拟化下无全文重排）。</summary>
+        private void TrimDisplay()
+        {
+            int overflow = _receiveLines.TotalChars - (MaxReceiveChars + TrimKeepMargin);
+            if (overflow <= 0) return;
+            int remove = 0;
+            int chars = 0;
+            foreach (ReceiveLine line in _receiveLines)   // 顺序扫描至覆盖溢出量（低频操作，开销可忽略）
+            {
+                if (chars > overflow) break;
+                chars += line.Text.Length + 2;
+                remove++;
+            }
+            _receiveLines.RemoveFromHead(remove);
+        }
+
+        /// <summary>暂停缓冲追加一行（含字符计数）。</summary>
+        private void PausedAddLine(ReceiveLine line)
+        {
+            _pausedLines.Add(line);
+            _pausedChars += line.Text.Length + 2;
+        }
+
+        /// <summary>暂停缓冲容量截头（与接收区同阈值，防止长时间暂停内存无界增长）。</summary>
+        private void TrimPausedLines()
+        {
+            int overflow = _pausedChars - (MaxReceiveChars + TrimKeepMargin);
+            if (overflow <= 0) return;
+            int remove = 0;
+            int chars = 0;
+            while (remove < _pausedLines.Count && chars <= overflow)
+            {
+                chars += _pausedLines[remove].Text.Length + 2;
+                remove++;
+            }
+            if (remove >= _pausedLines.Count)
+            {
+                _pausedLines.Clear();
+                _pausedChars = 0;
+                _pausedPendingItem = null;   // 下个数据块会重建未完成行条目
+            }
+            else
+            {
+                _pausedLines.RemoveRange(0, remove);
+                _pausedChars -= chars;
+            }
+        }
+
+        /// <summary>批次字符合计（容量核算，与集合 Weight 口径一致）。</summary>
+        private static int BatchChars(List<string> lines)
+        {
+            int sum = 0;
+            for (int i = 0; i < lines.Count; i++) sum += lines[i].Length + 2;
+            return sum;
+        }
+
+        /// <summary>关窗兜底：把未完成行写入保存文件（随后 DisposeSaveWriter 排空队列并释放）。</summary>
+        private void FlushPendingLineForSave()
+        {
+            string pending = FormatLine(_assembler.PendingText, false);
+            if (pending.Length > 0) EnqueueSaveText(_saveCarry + pending + "\r\n");
+            _saveCarry = string.Empty;
+        }
+
+        /// <summary>1 秒统计刷新：累计接收/发送字节、双向实时速率、连接时长（UI 线程定时器）。</summary>
+        private void TimerStats_Tick(object sender, EventArgs e)
+        {
+            long rx = _receivedBytesTotal;
+            long tx = _sentBytesTotal;
+            double rxKb = (rx - _lastStatsRx) / 1024.0;
+            double txKb = (tx - _lastStatsTx) / 1024.0;
+            _lastStatsRx = rx;
+            _lastStatsTx = tx;
+            string duration = _service.IsConnected
+                ? DateTime.Now.Subtract(_connectStartedAt).ToString(@"hh\:mm\:ss")
+                : "--:--:--";
+            txtStats.Text = $"累计收 {rx} B / 发 {tx} B　|　↓ {rxKb:F1} KB/s　↑ {txKb:F1} KB/s　|　连接 {duration}";
+        }
+
+        /// <summary>暂停显示开关：勾选暂停刷新，取消时一次性补齐暂停期间的数据。</summary>
+        private void ChkPauseReceive_Changed(object sender, RoutedEventArgs e)
+        {
+            if (chkPauseReceive.IsChecked == true)
+            {
+                UpdateStatus("接收显示已暂停，数据继续接收中");
+            }
+            else
+            {
+                ResumeDisplay();
+                UpdateStatus("已恢复接收显示");
+            }
+            if (!_loadingSettings) SaveSettings();
+        }
+
+        /// <summary>恢复显示：把暂停期间累积的行一次性入集合（筛选模式只补显示匹配行，缓冲在暂停期间已记录）。</summary>
+        private void ResumeDisplay()
+        {
+            if (_pausedLines.Count == 0) return;
+            List<ReceiveLine> lines = _pausedLines;
+            ReceiveLine pendingItem = _pausedPendingItem;
+            _pausedLines = new List<ReceiveLine>();
+            _pausedChars = 0;
+            _pausedPendingItem = null;
+
+            if (_filterState != null)
+            {
+                // 筛选模式：未完成行片段不参与匹配显示，其余行逐行过滤
+                var shown = new List<ReceiveLine>();
+                for (int i = 0; i < lines.Count; i++)
+                    if (lines[i] != pendingItem && MatchesFilter(lines[i].Text)) shown.Add(lines[i]);
+                _receiveLines.AddRange(shown);
+                if (pendingItem != null)
+                    _pendingItem = _receiveLines.AddLine(pendingItem.Text);   // 未完成行恢复实时更新
+            }
+            else
+            {
+                _receiveLines.AddRange(lines);
+                _pendingItem = pendingItem;   // 未完成行条目已随批入集合，保持原位更新
+            }
+            TrimDisplay();
+            if (chkAutoScroll.IsChecked == true && _receiveLines.Count > 0)
+                lstReceive.ScrollIntoView(_receiveLines[_receiveLines.Count - 1]);
+        }
+
+        /// <summary>字节数组转 "AA BB CC" 形式（本地回显 hex 模式用）。</summary>
+        private static string FormatHex(byte[] bytes)
+        {
+            var sb = new StringBuilder(bytes.Length * 3);
+            foreach (byte b in bytes)
+                sb.Append(b.ToString("X2")).Append(' ');
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>本地回显：勾选后把发送内容以 [TX] 前缀追加到接收区（与接收数据同管线，含时间戳与文件保存）。</summary>
+        private void AppendLocalEcho(string content)
+        {
+            if (chkLocalEcho.IsChecked != true) return;
+            string text = content.TrimEnd('\r', '\n');
+            if (text.Length == 0) return;
+            EmitCompletedLine(text, true);   // 回显内容自成一行，独立于未完成行
+            OnAssemblerPendingUpdated();     // 立即入集合（不等待下一个接收数据块）
         }
 
         // ============================================================
@@ -941,13 +1096,18 @@ namespace SerialPort
             _receivedBytesTotal = 0;
             _lastStatsRx = 0;   // 速率快照同步复位，避免清空后速率虚高
             _textDecoder.Reset();   // 视觉清空后解码状态同步复位，避免新数据开头残留乱码
-            _atLineStart = true;    // 清空后回到行首状态：新数据首行应补时间戳
-            _pausedBuffer.Clear();  // 暂停缓冲一并清空，恢复时不再显示旧数据
-            // 同时复位搜索 / 筛选状态，保证清空后显示一致
-            _searchIndex = -1;
+            // 行管线与各缓冲全部复位，保证清空后显示 / 保存 / 搜索 / 筛选状态一致
+            _assembler.Reset();
+            _batchLines.Clear();
+            _saveCarry = string.Empty;
+            _pendingItem = null;
+            _pausedLines.Clear();
+            _pausedChars = 0;
+            _pausedPendingItem = null;
+            _searchPos = null;
             _filterState = null;
-            txtReceive.Clear();
-            _receiveTextLength = 0;
+            _receiveLines.ClearItems();
+            SearchHighlight.SetTerm(this, string.Empty);   // 清除高亮状态
             UpdateStatus("已清空接收区");
         }
 
@@ -966,51 +1126,117 @@ namespace SerialPort
             dlg.ShowDialog();
         }
 
-        /// <summary>在接收区中查找匹配项并高亮显示；找到返回 true。backward = true 时向上查找（否则向下），找不到则环绕。</summary>
-        internal bool Find(string term, bool matchCase, bool wholeWord, bool backward)
+        /// <summary>在接收区中行级查找匹配项：高亮全部匹配片段并滚动定位到目标行，返回"第几处/共几处"。</summary>
+        internal FindResult Find(string term, bool matchCase, bool wholeWord, bool backward)
         {
-            string text = txtReceive.Text;
-            if (string.IsNullOrEmpty(term) || text.Length == 0) return false;
+            var miss = new FindResult();
+            if (string.IsNullOrEmpty(term) || _receiveLines.Count == 0) return miss;
             UpdateSearchState(term, matchCase, wholeWord);
+            ValidateSearchPos();
 
-            int idx;
+            int curLine = -1;
+            int curOcc = -1;
+            if (_searchPos != null)
+            {
+                curLine = _receiveLines.IndexOf(_searchPos.Line);
+                curOcc = curLine >= 0 ? _searchPos.Occurrence : -1;
+            }
+
+            // 单趟扫描：统计全部匹配处数，同时记录第一个 / 最后一个匹配，
+            // 以及严格晚于当前位置（forward 用）/ 早于当前位置（backward 用）的匹配
+            int total = 0;
+            int firstLine = -1, firstOcc = 0, firstRank = 0;
+            int lastLine = -1, lastOcc = 0, lastRank = 0;
+            int fwdLine = -1, fwdOcc = 0, fwdRank = 0;
+            int bwdLine = -1, bwdOcc = 0, bwdRank = 0;
+
+            for (int li = 0; li < _receiveLines.Count; li++)
+            {
+                string text = _receiveLines[li].Text;
+                int occ = 0;
+                int idx = 0;
+                while ((idx = TextMatch.FindMatchIndex(text, term, idx, matchCase, wholeWord)) >= 0)
+                {
+                    total++;
+                    if (firstLine < 0) { firstLine = li; firstOcc = occ; firstRank = total; }
+                    lastLine = li; lastOcc = occ; lastRank = total;
+                    if (li > curLine || (li == curLine && occ > curOcc))
+                    {
+                        if (fwdLine < 0) { fwdLine = li; fwdOcc = occ; fwdRank = total; }
+                    }
+                    else
+                    {
+                        bwdLine = li; bwdOcc = occ; bwdRank = total;
+                    }
+                    occ++;
+                    idx += term.Length;
+                }
+            }
+            if (total == 0) return miss;
+
+            // 方向选择 + 环绕：向后找不到回绕到最后一个；向前找不到回绕到第一个
+            int tLine, tOcc, tRank;
             if (backward)
             {
-                int limit = _searchIndex < 0 ? text.Length : _searchIndex;
-                idx = FindMatchIndexBackward(text, term, limit, matchCase, wholeWord);
-                // 环绕条件用 _searchIndex >= 0（而非 limit > 0）：已在首个匹配处（_searchIndex == 0）
-                // 时 limit 为 0，用 limit > 0 判断会漏掉环绕，误报"未找到匹配项"
-                if (idx < 0 && _searchIndex >= 0)
-                    idx = FindMatchIndexBackward(text, term, text.Length, matchCase, wholeWord);   // 环绕
+                if (bwdLine >= 0) { tLine = bwdLine; tOcc = bwdOcc; tRank = bwdRank; }
+                else { tLine = lastLine; tOcc = lastOcc; tRank = lastRank; }
             }
             else
             {
-                int from = _searchIndex < 0 ? 0 : _searchIndex + term.Length;
-                idx = FindMatchIndex(text, term, from, matchCase, wholeWord);
-                if (idx < 0 && from > 0) idx = FindMatchIndex(text, term, 0, matchCase, wholeWord);   // 环绕
+                if (fwdLine >= 0) { tLine = fwdLine; tOcc = fwdOcc; tRank = fwdRank; }
+                else { tLine = firstLine; tOcc = firstOcc; tRank = firstRank; }
             }
-            if (idx < 0) return false;
 
-            HighlightMatch(idx, term.Length);
-            _searchIndex = idx;
-            return true;
+            _searchPos = new SearchPos { Line = _receiveLines[tLine], Occurrence = tOcc };
+            lstReceive.ScrollIntoView(_receiveLines[tLine]);
+            return new FindResult { Found = true, Current = tRank, Total = total };
         }
 
-        /// <summary>搜索词或匹配选项变化时重置查找位置（接收区清空时由 BtnClearReceive_Click 复位）。</summary>
+        /// <summary>搜索词或匹配选项变化时重置查找位置，并把搜索状态同步到窗口（可继承附加属性传播驱动行高亮重建）。</summary>
         private void UpdateSearchState(string term, bool matchCase, bool wholeWord)
         {
             if (_searchTerm != term || _searchMatchCase != matchCase || _searchWholeWord != wholeWord)
-                _searchIndex = -1;
+                _searchPos = null;
             _searchTerm = term;
             _searchMatchCase = matchCase;
             _searchWholeWord = wholeWord;
+            SearchHighlight.SetTerm(this, term);
+            SearchHighlight.SetMatchCase(this, matchCase);
+            SearchHighlight.SetWholeWord(this, wholeWord);
         }
 
-        /// <summary>选中并滚动到匹配项（接收框只读，选中即高亮显示）。</summary>
-        private void HighlightMatch(int index, int length)
+        /// <summary>当前匹配位置有效性校验：行被 FIFO 截头移除后自动复位（下一次查找从头 / 尾开始）。</summary>
+        private void ValidateSearchPos()
         {
-            txtReceive.Select(index, length);
-            txtReceive.ScrollToLine(txtReceive.GetLineIndexFromCharacterIndex(index));
+            if (_searchPos != null && _receiveLines.IndexOf(_searchPos.Line) < 0)
+                _searchPos = null;
+        }
+
+        /// <summary>搜索高亮色按当前主题取资源（构造时与主题切换后调用）。</summary>
+        private void UpdateSearchHighlightBrush()
+        {
+            SearchHighlight.SetBrush(this, TryFindResource("SearchHighlightBrush") as Brush);
+        }
+
+        /// <summary>接收区 Ctrl+C：复制选中行文本（按行序拼接，每行一行；Ctrl+A 全选为 ListBox 默认行为）。</summary>
+        private void LstReceive_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.C || Keyboard.Modifiers != ModifierKeys.Control) return;
+            if (lstReceive.SelectedItems.Count == 0) return;
+
+            var indices = new List<int>();
+            foreach (object item in lstReceive.SelectedItems)
+            {
+                int index = _receiveLines.IndexOf(item as ReceiveLine);
+                if (index >= 0) indices.Add(index);
+            }
+            indices.Sort();
+            var sb = new StringBuilder();
+            for (int i = 0; i < indices.Count; i++)
+                sb.AppendLine(_receiveLines[indices[i]].Text);
+            try { Clipboard.SetText(sb.ToString()); }
+            catch { }   // 剪贴板被其他进程占用等异常：忽略，不中断界面
+            e.Handled = true;
         }
 
         /// <summary>应用筛选：接收区仅显示包含筛选内容的行，新数据只追加匹配行。</summary>
@@ -1023,9 +1249,11 @@ namespace SerialPort
             }
             if (_filterState == null)
             {
-                // 首次启用：以当前接收区内容作为全量文本（此后新数据同时记入缓冲）
+                // 首次启用：以当前显示行作为全量缓冲快照（此后新数据同时记入缓冲）
                 _filterState = new FilterState();
-                _filterState.Buffer.Append(txtReceive.Text);
+                foreach (ReceiveLine line in _receiveLines)
+                    _filterState.Lines.Add(line);
+                _filterState.CharCount = _receiveLines.TotalChars;
             }
             _filterState.Term = term;
             _filterState.MatchCase = matchCase;
@@ -1034,124 +1262,68 @@ namespace SerialPort
             UpdateStatus($"筛选已启用：{term}");
         }
 
-        /// <summary>清除筛选：恢复显示完整接收内容。</summary>
+        /// <summary>清除筛选：恢复显示全量缓冲内容。</summary>
         internal void ClearFilter()
         {
             if (_filterState == null) return;
-            txtReceive.Text = _filterState.Buffer.ToString();
-            _receiveTextLength = txtReceive.Text.Length;
+            List<ReceiveLine> lines = _filterState.Lines;
             _filterState = null;
-            if (chkAutoScroll.IsChecked == true) txtReceive.ScrollToEnd();
+            _receiveLines.ClearItems();
+            _pendingItem = null;      // 未完成行条目随视图重建，待下个数据块重新建立
+            _searchPos = null;
+            _receiveLines.AddRange(lines);
+            TrimDisplay();
+            if (chkAutoScroll.IsChecked == true && _receiveLines.Count > 0)
+                lstReceive.ScrollIntoView(_receiveLines[_receiveLines.Count - 1]);
             UpdateStatus("已清除筛选");
         }
 
         /// <summary>按当前筛选条件重建接收区显示内容。</summary>
         private void RebuildFilteredView()
         {
-            txtReceive.Clear();
-            _receiveTextLength = 0;
+            _receiveLines.ClearItems();
+            _pendingItem = null;
+            _searchPos = null;
             if (_filterState == null) return;
-            foreach (string line in SplitLines(_filterState.Buffer.ToString()))
-                AppendLineIfMatches(line);
-            if (chkAutoScroll.IsChecked == true) txtReceive.ScrollToEnd();
+            var shown = new List<ReceiveLine>();
+            for (int i = 0; i < _filterState.Lines.Count; i++)
+                if (MatchesFilter(_filterState.Lines[i].Text)) shown.Add(_filterState.Lines[i]);
+            _receiveLines.AddRange(shown);
+            if (chkAutoScroll.IsChecked == true && _receiveLines.Count > 0)
+                lstReceive.ScrollIntoView(_receiveLines[_receiveLines.Count - 1]);
         }
 
-        /// <summary>筛选启用期间追加新数据：只显示包含筛选内容的行，未结束的行暂存待续。</summary>
-        private void AppendFiltered(string increment)
+        /// <summary>整行包含筛选内容时返回 true（与查找相同的匹配语义）。</summary>
+        private bool MatchesFilter(string line)
         {
-            // 不变量：PendingLine 中不含换行；仅当本块含换行时才整行拆分处理
-            if (increment.IndexOfAny(NewLineChars) < 0)
+            return TextMatch.FindMatchIndex(line, _filterState.Term, 0, _filterState.MatchCase, _filterState.WholeWord) >= 0;
+        }
+
+        /// <summary>筛选缓冲容量截头：按字符数从头部移除整行，防止长时运行内存无界。</summary>
+        private void TrimFilterBuffer()
+        {
+            FilterState fs = _filterState;
+            int overflow = fs.CharCount - (MaxReceiveChars + TrimKeepMargin);
+            if (overflow <= 0) return;
+            int remove = 0;
+            int chars = 0;
+            while (remove < fs.Lines.Count && chars <= overflow)
             {
-                AppendPendingLine(increment);
-                return;
+                chars += fs.Lines[remove].Text.Length + 2;
+                remove++;
             }
-            AppendPendingLine(increment);
-            string[] lines = SplitLines(_filterState.PendingLine.ToString());
-            _filterState.PendingLine.Clear();
-            _filterState.PendingLine.Append(lines[lines.Length - 1]);   // 末段可能是不完整的一行，继续暂存
-            for (int i = 0; i < lines.Length - 1; i++)
-                AppendLineIfMatches(lines[i]);
-        }
-
-        /// <summary>追加到未完成行暂存（含超限截头：无换行的持续数据流如二进制会使其无界增长）。</summary>
-        private void AppendPendingLine(string s)
-        {
-            StringBuilder pending = _filterState.PendingLine;
-            pending.Append(s);
-            if (pending.Length > MaxReceiveChars + TrimKeepMargin)
-                pending.Remove(0, MaxReceiveChars);   // 截头保留最近片段：该行本就不完整，丢弃头部可接受
-        }
-
-        /// <summary>整行包含筛选内容时追加显示（含行尾换行）。</summary>
-        private void AppendLineIfMatches(string line)
-        {
-            if (FindMatchIndex(line, _filterState.Term, 0, _filterState.MatchCase, _filterState.WholeWord) >= 0)
+            if (remove > 0)
             {
-                txtReceive.AppendText(line);
-                txtReceive.AppendText("\r\n");
-                _receiveTextLength += line.Length + 2;
+                fs.Lines.RemoveRange(0, remove);
+                fs.CharCount -= chars;
             }
         }
 
-        /// <summary>换行符检测（与 SplitLines 支持的范围一致）。</summary>
-        private static readonly char[] NewLineChars = { '\r', '\n' };
-
-        /// <summary>判断字符是否为换行符（与 <see cref="NewLineChars"/> 一致）。</summary>
-        private static bool IsNewLineChar(char c) => c == '\r' || c == '\n';
-
-        /// <summary>按行拆分（兼容 \r\n、\r、\n 三种换行）。</summary>
-        private static string[] SplitLines(string text) =>
-            text.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
-
-        /// <summary>在 text 中从 startIndex 起正向查找 term，返回匹配起始下标；未找到返回 -1。</summary>
-        private static int FindMatchIndex(string text, string term, int startIndex, bool matchCase, bool wholeWord)
-        {
-            if (startIndex < 0 || startIndex >= text.Length) return -1;
-            StringComparison cmp = matchCase ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
-            int idx = text.IndexOf(term, startIndex, cmp);
-            while (idx >= 0)
-            {
-                if (!wholeWord || IsWholeWordAt(text, idx, term.Length)) return idx;
-                idx = text.IndexOf(term, idx + 1, cmp);
-            }
-            return -1;
-        }
-
-        /// <summary>查找起点小于 limit 的最后一个匹配；未找到返回 -1。
-        /// 利用 LastIndexOf 的语义（匹配整体落在 [0, startIndex] 内）：
-        /// 起点 &lt; limit 等价于终点 &lt;= limit - 1，故 startIndex = limit + term.Length - 2。</summary>
-        private static int FindMatchIndexBackward(string text, string term, int limit, bool matchCase, bool wholeWord)
-        {
-            if (limit <= 0) return -1;
-            StringComparison cmp = matchCase ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
-            int startIndex = Math.Min(limit, text.Length) + term.Length - 2;
-            if (startIndex > text.Length - 1) startIndex = text.Length - 1;
-            int idx = text.LastIndexOf(term, startIndex, cmp);
-            while (idx >= 0)
-            {
-                if (!wholeWord || IsWholeWordAt(text, idx, term.Length)) return idx;
-                if (idx == 0) break;
-                idx = text.LastIndexOf(term, idx + term.Length - 2, cmp);   // 向前找下一个起点更小的匹配
-            }
-            return -1;
-        }
-
-        /// <summary>判断 [index, index+length) 是否为全词匹配（两侧都不是单词字符，中文按一个词处理）。</summary>
-        private static bool IsWholeWordAt(string text, int index, int length)
-        {
-            bool leftOk = index == 0 || !IsWordChar(text[index - 1]);
-            bool rightOk = index + length >= text.Length || !IsWordChar(text[index + length]);
-            return leftOk && rightOk;
-        }
-
-        /// <summary>单词字符：字母（含中文）、数字、下划线。</summary>
-        private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
-
-        /// <summary>筛选状态：启用筛选时保存完整接收文本与筛选条件；禁用时 _filterState 为 null。</summary>
+        /// <summary>筛选状态：启用筛选时保存全量行缓冲与筛选条件；禁用时 _filterState 为 null。</summary>
         private sealed class FilterState
         {
-            public readonly StringBuilder Buffer = new StringBuilder();        // 完整接收文本
-            public readonly StringBuilder PendingLine = new StringBuilder();   // 未以换行结束的行片段（不含换行）
+            public readonly List<ReceiveLine> Lines = new List<ReceiveLine>();   // 全量已完成行（含格式化前缀）
+            public int CharCount;   // 缓冲字符合计（容量核算）
             public string Term;
             public bool MatchCase;
             public bool WholeWord;

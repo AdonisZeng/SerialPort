@@ -14,4 +14,6 @@
     <SolidColorBrush x:Key="SecondaryBtnBorderBrush" Color="#5A5F6E" />
     <!-- 下拉框悬停/展开背景（深色主题专用色，替代 SystemColors.Highlight） -->
     <SolidColorBrush x:Key="ComboHoverBackBrush" Color="#3A4050" />
+    <!-- 搜索匹配高亮（接收区行内匹配片段背景色） -->
+    <SolidColorBrush x:Key="SearchHighlightBrush" Color="#80E6A23C" />
 </ResourceDictionary>
