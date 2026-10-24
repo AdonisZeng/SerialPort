@@ -103,7 +103,10 @@ namespace SerialPort
             }
             string name = txtName.Text.Trim().Replace("\t", " ");   // 名称中不允许制表符（序列化分隔符）
             if (string.IsNullOrEmpty(name))
-                name = Truncate(text);
+            {
+                // 名称是序列化分隔符前的字段，不能含制表符（Truncate 只把换行替换掉了）
+                name = Truncate(text).Replace("\t", " ");
+            }
             string item = name + "\t" + text;
 
             int index = lstCommands.SelectedIndex;
@@ -162,9 +165,15 @@ namespace SerialPort
             string name, text;
             SplitItem(_items[index], out name, out text);
             if (_main.SendText(text))
-                txtStatus.Text = $"已发送：{(string.IsNullOrEmpty(name) ? "指令" : name)}";
+            {
+                // 发送走后台写队列：这里只能确认"已提交"，真正写出后接收区才会出现 [TX] 行。
+                // 写成"已发送"会在设备写入受阻 / 拔出时给出错误结论
+                txtStatus.Text = $"已提交发送：{(string.IsNullOrEmpty(name) ? "指令" : name)}";
+            }
             else
+            {
                 txtStatus.Text = "发送失败（请检查串口连接与内容格式）。";
+            }
         }
 
         private void BtnClose_Click(object sender, RoutedEventArgs e) => Close();

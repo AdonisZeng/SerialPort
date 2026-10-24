@@ -36,9 +36,8 @@ namespace SerialPort.Services
         private byte[] _footer;   // 帧尾（null = 未配置）
         private FrameChecksum _checksum;
         private readonly List<byte> _buffer = new List<byte>();   // 当前帧收集缓冲
-        private int _headerMatch;   // 帧头匹配进度（仅帧尾定界模式用；帧头定界模式改用 _partial 候选窗口）
         private bool _inFrame;      // 帧尾定界模式下：已识别帧头（或无帧头时的收集状态）
-        // 帧头定界模式的"候选窗口"：始终是 _header 的一个前缀（长度 0.._header.Length-1）。
+        // 两种定界模式共用的"候选窗口"：始终是 _header 的一个前缀（长度 0.._header.Length-1）。
         // 帧头自重叠（如帧头 AA AA 55、帧体出现 AA AA AA 55）时必须对窗口整体回退重扫，
         // 只回退"当前字节"会漏掉窗口中间的帧头，故不匹配时逐个出队而不是整段丢弃。
         private readonly List<byte> _partial = new List<byte>();
@@ -60,8 +59,22 @@ namespace SerialPort.Services
         {
             _buffer.Clear();
             _partial.Clear();
-            _headerMatch = 0;
             _inFrame = false;
+        }
+
+        /// <summary>
+        /// 输出缓冲区中尚未定界的残留帧（流结束 / 串口断开时调用），并复位解析状态。
+        /// 仅帧头定界模式输出：该模式本就没有帧尾，"流结束"即一帧结束，末帧只能靠
+        /// 下一个帧头或此方法收尾。帧尾定界模式的缓冲是"还没等到帧尾"的半帧，
+        /// 按定义不成立，输出只会凭空多一行脏数据（且校验必然失败），故直接丢弃。
+        /// </summary>
+        public List<Frame> Flush()
+        {
+            var frames = new List<Frame>();
+            if (_footer == null && _buffer.Count > 0)
+                frames.Add(MakeFrame(_buffer.ToArray()));
+            Reset();
+            return frames;
         }
 
         /// <summary>解析出的完整帧。</summary>
@@ -91,6 +104,10 @@ namespace SerialPort.Services
 
         // ============ 帧尾定界模式 ============
 
+        /// <summary>
+        /// 帧尾定界模式：帧尾出现即完成一帧。帧头匹配与帧头定界模式共用候选窗口语义，
+        /// 才能识别帧头自重叠（朴素单指针回退会漏掉窗口中间的帧头）。
+        /// </summary>
         private void PushFooterMode(byte[] data, List<Frame> frames)
         {
             foreach (byte b in data)
@@ -117,23 +134,19 @@ namespace SerialPort.Services
                     continue;
                 }
 
-                // 有帧头：先匹配帧头
-                if (b == _header[_headerMatch])
+                // 有帧头：候选窗口先于帧开始积累，不再是帧头前缀就逐字节出队丢弃
+                // （帧头前的孤立数据不构成帧）。与帧头定界模式同一套语义，才能识别
+                // 帧头自重叠（帧头 AA AA 55，流中出现 AA AA AA 55）
+                _partial.Add(b);
+                while (_partial.Count > 0 && !IsHeaderPrefix())
+                    _partial.RemoveAt(0);
+
+                if (_partial.Count == _header.Length)
                 {
-                    _headerMatch++;
-                    if (_headerMatch == _header.Length)
-                    {
-                        _buffer.Clear();
-                        _buffer.AddRange(_header);
-                        _inFrame = true;
-                        _headerMatch = 0;
-                    }
-                }
-                else
-                {
-                    // 部分匹配失败：回退比较当前字节与帧头首字节（重复首字节模式如 AA AA 55 不丢帧头），
-                    // 不匹配则丢弃该字节（帧头前的孤立数据不构成帧）
-                    _headerMatch = b == _header[0] ? 1 : 0;
+                    _buffer.Clear();
+                    _buffer.AddRange(_header);
+                    _partial.Clear();
+                    _inFrame = true;
                 }
             }
         }
@@ -195,7 +208,6 @@ namespace SerialPort.Services
             }
             _buffer.AddRange(_header);
             _partial.Clear();
-            _headerMatch = 0;
         }
 
         // ============ 帧构造与校验 ============
@@ -211,7 +223,9 @@ namespace SerialPort.Services
             }
 
             int crcBytes = _checksum == FrameChecksum.Crc16Modbus ? 2 : 1;
-            if (_footer != null && _footer.Length == crcBytes)
+            // 帧尾即校验值时按"帧尾 = 预期校验值"校验；长度不足校验字节数的帧
+            //（如仅在帧头定界模式才会出现的极短帧）走整帧参考值分支，避免取下标越界
+            if (_footer != null && _footer.Length == crcBytes && frame.Length >= crcBytes)
             {
                 // 帧尾即预期校验值：校验范围 = 帧去掉帧尾
                 int dataLen = frame.Length - crcBytes;

@@ -4,3 +4,5 @@ obj/
 *.csproj.user
 docs/
 .codegraph/
+# 工具（AI 编码）生成的规格 / 计划产物，不入版本库
+.trae/

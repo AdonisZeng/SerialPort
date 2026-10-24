@@ -58,7 +58,8 @@
         <!-- 底部按钮行 -->
         <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,8,0,0">
             <CheckBox x:Name="chkPause" Content="暂停解析" VerticalAlignment="Center" Margin="0,0,12,0"
-                      ToolTip="暂停后数据不再解析，恢复后从最新数据继续" />
+                      Checked="ChkPause_Changed" Unchecked="ChkPause_Changed"
+                      ToolTip="暂停后数据先缓存，恢复后按序补解析；缓存超限（1 MB）时丢弃最旧数据并在下方提示" />
             <Button x:Name="btnClear" Content="清空列表" Click="BtnClear_Click"
                     Style="{StaticResource SecondaryButtonStyle}" Width="80" Height="26" Margin="0,0,8,0" />
             <Button x:Name="btnClose" Content="关闭" Click="BtnClose_Click"

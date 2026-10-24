@@ -11,6 +11,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Threading;
 
 namespace SerialPort.Services
 {
@@ -43,13 +44,17 @@ namespace SerialPort.Services
         private readonly SynchronizationContext _syncContext;
         // 检查中标志（0 = 空闲，1 = 检查中）：UI 线程置位、后台线程复位，用 Interlocked 保证跨线程可见性
         private int _checking;
-        // 上次上报的下载进度百分比（同一百分比不重复上报，降低大文件下载时的 UI 事件频率）
-        private int _lastProgressPercent = -1;
+        // 上次上报的下载进度百分比（同一百分比不重复上报，降低大文件下载时的 UI 事件频率）。
+        // 初值不能取 -1：-1 是"进度未知"的合法上报值，取 -1 会把首次未知进度当作重复丢弃。
+        private int _lastProgressPercent = int.MinValue;
 
         /// <summary>版本检查完成时触发（已在 UI 线程回调），携带检查结果。</summary>
         public event EventHandler<UpdateCheckResult> CheckCompleted;
 
-        /// <summary>下载进度变化时触发（已在 UI 线程回调），Percent 为 0-100。</summary>
+        /// <summary>
+        /// 下载进度变化时触发（已在 UI 线程回调）。Percent 为 0-100；
+        /// 下载大小未知（服务端未返回 Content-Length）时为 -1，表示进度不可知。
+        /// </summary>
         public event EventHandler<int> UpdateProgress;
 
         /// <summary>检查 / 下载 / 替换任一环节出错时触发（已在 UI 线程回调）。</summary>
@@ -60,8 +65,10 @@ namespace SerialPort.Services
 
         public UpdateService()
         {
-            // 捕获当前同步上下文，把后台线程事件切回 UI 线程（服务须在 UI 线程上构造）
-            _syncContext = SynchronizationContext.Current ?? new SynchronizationContext();
+            // 回退到创建线程的 Dispatcher 上下文：服务在 UI 线程构造，
+            // 裸 SynchronizationContext 的 Post 会在线程池执行，事件落到错误线程
+            _syncContext = SynchronizationContext.Current
+                ?? new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher);
         }
 
         /// <summary>当前程序版本（取自程序集版本号）。</summary>
@@ -137,8 +144,15 @@ namespace SerialPort.Services
                 string newExe = null;   // 下载目标路径：取消时清理残留
                 try
                 {
-                    _lastProgressPercent = -1;   // 重试时保证 0% 会重新上报
-                    string workDir = Path.Combine(Path.GetTempPath(), "SerialPortUpdate");
+                    // 重试时复位进度去重（用 int.MinValue 而非 -1：-1 是"进度未知"的合法值）
+                    _lastProgressPercent = int.MinValue;
+                    // 按进程隔离：多实例同时更新时互不覆盖/互删临时文件
+                    //（取消或失败会删除整个工作目录，共享目录会误删其他实例的下载结果）
+                    // Process 实现 IDisposable：仅取 ID 也要释放（句柄泄漏虽小但无必要）
+                    string processTag;
+                    using (Process self = Process.GetCurrentProcess())
+                        processTag = self.Id.ToString();
+                    string workDir = Path.Combine(Path.GetTempPath(), "SerialPortUpdate", processTag);
                     Directory.CreateDirectory(workDir);
 
                     string exePath = Assembly.GetExecutingAssembly().Location;
@@ -259,7 +273,8 @@ namespace SerialPort.Services
             if (latest == null)
                 return result;   // 仓库还没有任何 Release：视为“无可用更新”
             result.LatestVersion = latest;
-            result.IsUpdateAvailable = latest.CompareTo(result.CurrentVersion) > 0;
+            // 程序集版本是 4 段、tag 解析结果常只有 3 段，必须归一化后比较
+            result.IsUpdateAvailable = CompareVersion(latest, result.CurrentVersion) > 0;
             if (!result.IsUpdateAvailable)
                 return result;
 
@@ -370,7 +385,7 @@ namespace SerialPort.Services
                         ExeUrl = cache.ExeUrl,
                         Sha256Url = cache.Sha256Url,
                         ConfigUrl = cache.ConfigUrl,
-                        IsUpdateAvailable = latest != null && latest.CompareTo(CurrentVersion) > 0,
+                        IsUpdateAvailable = latest != null && CompareVersion(latest, CurrentVersion) > 0,
                     };
                 }
             }
@@ -433,6 +448,7 @@ namespace SerialPort.Services
                 using (HttpResponseMessage resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false))
                 {
                     resp.EnsureSuccessStatusCode();
+                    // 可能为 0：服务端未返回 Content-Length，此时进度不可知
                     long total = resp.Content.Headers.ContentLength ?? 0;
                     using (Stream input = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
                     using (var output = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true))
@@ -480,29 +496,63 @@ namespace SerialPort.Services
         /// <summary>字节序标记字符（U+FEFF）。</summary>
         private const char BomChar = '\uFEFF';
 
-        /// <summary>把 "v1.0.1" 形式的 tag 解析为版本号；解析失败返回 null。</summary>
+        /// <summary>
+        /// 把 "v1.2.3" / "v1.2.3-beta.1" / "v1.2.3+build" 形式的 tag 解析为版本号；
+        /// 语义版本允许预发布/构建元数据后缀，Version.TryParse 不支持，先截断后缀。
+        /// 解析失败返回 null（调用方按"无可用发布"处理）。
+        /// </summary>
         private static Version ParseTagVersion(string tag)
         {
             if (string.IsNullOrEmpty(tag)) return null;
             string s = tag.TrimStart('v', 'V');
+            int cut = s.IndexOfAny(new[] { '-', '+' });
+            if (cut >= 0) s = s.Substring(0, cut);
             Version v;
             return Version.TryParse(s, out v) ? v : null;
         }
 
         /// <summary>
+        /// 归一化为 4 段版本：程序集版本恒为 4 段，tag 解析结果可能只有 2~3 段，
+        /// Version.CompareTo 会把缺失段当作 -1，导致等值版本被判为更旧。
+        /// </summary>
+        private static Version NormalizeVersion(Version v)
+        {
+            if (v == null) return null;
+            return new Version(v.Major, v.Minor, Math.Max(v.Build, 0), Math.Max(v.Revision, 0));
+        }
+
+        /// <summary>按归一化后的 4 段版本比较（&gt; 0 表示后者更新）。</summary>
+        private static int CompareVersion(Version left, Version right)
+        {
+            return NormalizeVersion(left).CompareTo(NormalizeVersion(right));
+        }
+
+        /// <summary>
         /// 进度事件编组回 UI 线程（同一百分比只上报一次，避免大文件下载时 UI 事件风暴）。
         /// 本文件进度映射到 [basePercent, basePercent + spanPercent] 区间，保证多文件下载时进度单调上升。
+        /// total &lt;= 0 时上报 -1 表示进度未知（服务端未返回 Content-Length）：此时固定停在
+        /// basePercent 会让进度条看起来卡死，调用方应改用不确定进度条。
         /// </summary>
         private void ReportProgress(long done, long total, int basePercent, int spanPercent)
         {
-            int percent = total > 0 ? basePercent + (int)(done * spanPercent / total) : basePercent;
+            int percent = total > 0
+                ? basePercent + (int)(done * spanPercent / total)
+                : -1;   // -1 = 进度未知，越过下面的百分比钳位
             if (percent > 100) percent = 100;   // 防御：ContentLength 与实际大小不符时钳位
             if (percent == _lastProgressPercent) return;
             _lastProgressPercent = percent;
             Post(() => UpdateProgress?.Invoke(this, percent));
         }
 
-        private void Post(Action action) => _syncContext.Post(_ => action(), null);
+        /// <summary>
+        /// 把动作切回 UI 线程执行。关窗后调度器可能已关闭（BeginInvoke 抛 InvalidOperationException），
+        /// 此时结果已无人消费，静默丢弃；只收窄捕获该异常，其余异常照常暴露。
+        /// </summary>
+        private void Post(Action action)
+        {
+            try { _syncContext.Post(_ => action(), null); }
+            catch (InvalidOperationException) { }   // 调度器已关闭：结果已无人消费
+        }
     }
 
     /// <summary>版本检查结果。</summary>
@@ -523,7 +573,7 @@ namespace SerialPort.Services
         /// <summary>程序附件下载地址（可为 null，说明发布不完整）。</summary>
         public string ExeUrl { get; set; }
 
-        /// <summary>SHA256 校验文件下载地址（可选，缺失时跳过校验）。</summary>
+        /// <summary>SHA256 校验文件下载地址（必需，缺失时拒绝更新）。</summary>
         public string Sha256Url { get; set; }
 
         /// <summary>配置文件附件下载地址（可选）。</summary>

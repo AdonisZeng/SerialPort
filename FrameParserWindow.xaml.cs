@@ -17,6 +17,11 @@ namespace SerialPort
     {
         private readonly FrameParser _parser = new FrameParser();
 
+        // 暂停期间缓存的原始字节：解析必须连续，丢弃会让帧边界永久错位
+        private readonly List<byte> _pausedData = new List<byte>();
+        /// <summary>暂停缓存上限：超出后丢弃最旧数据，防止长时间暂停内存无界。</summary>
+        private const int MaxPausedBytes = 1024 * 1024;
+
         /// <summary>帧列表上限：超出截头，防止长时间运行内存无界增长。</summary>
         private const int MaxFrameRows = 2000;
 
@@ -33,10 +38,54 @@ namespace SerialPort
         /// <summary>MainWindow 喂入接收数据（UI 线程调用；窗口打开期间才被调用）。</summary>
         internal void PushData(byte[] data)
         {
-            if (chkPause.IsChecked == true) return;
-            List<FrameParser.Frame> frames = _parser.Push(data);
-            foreach (FrameParser.Frame frame in frames)
-                AddFrame(frame);
+            if (data == null || data.Length == 0) return;
+            if (chkPause.IsChecked == true)
+            {
+                int before = _pausedData.Count;
+                _pausedData.AddRange(data);
+                // 超限保留最新 MaxPausedBytes 字节：丢的是最旧的数据，帧边界从此处开始错位
+                if (_pausedData.Count > MaxPausedBytes)
+                    _pausedData.RemoveRange(0, _pausedData.Count - MaxPausedBytes);
+                int discarded = before + data.Length - _pausedData.Count;
+                if (discarded > 0)
+                {
+                    // 必须显式告知：此前 tooltip 承诺"不丢字节"，而这里确实丢了最旧的一段
+                    txtStatus.Text = $"暂停缓存超限，已丢弃最旧 {discarded} 字节（帧边界可能错位）";
+                }
+                return;
+            }
+            ProcessFrames(_parser.Push(data));
+        }
+
+        /// <summary>把一批解析出的帧追加到列表（保持列表上限与底部跟随逻辑）。</summary>
+        private void ProcessFrames(List<FrameParser.Frame> frames)
+        {
+            if (frames == null || frames.Count == 0) return;
+            for (int i = 0; i < frames.Count; i++)
+                AddFrame(frames[i]);
+        }
+
+        /// <summary>暂停状态切换：恢复时按序补喂暂停期间缓存的字节，再输出解析结果。</summary>
+        private void ChkPause_Changed(object sender, RoutedEventArgs e)
+        {
+            if (chkPause.IsChecked == true || _pausedData.Count == 0) return;
+            byte[] buffered = _pausedData.ToArray();
+            _pausedData.Clear();
+            // 分块喂入：一次性喂 1 MB 会让解析器在 UI 线程上长时间占用
+            const int chunk = 16 * 1024;
+            for (int offset = 0; offset < buffered.Length; offset += chunk)
+            {
+                int count = Math.Min(chunk, buffered.Length - offset);
+                var slice = new byte[count];
+                Array.Copy(buffered, offset, slice, 0, count);
+                ProcessFrames(_parser.Push(slice));
+            }
+        }
+
+        /// <summary>输出解析器残留的末帧（串口断开 / 流结束时由主窗口调用）。</summary>
+        internal void FlushPendingFrame()
+        {
+            ProcessFrames(_parser.Flush());
         }
 
         private void AddFrame(FrameParser.Frame frame)

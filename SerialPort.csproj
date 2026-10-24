@@ -8,7 +8,7 @@
     <OutputType>WinExe</OutputType>
     <RootNamespace>SerialPort</RootNamespace>
     <AssemblyName>SerialPort</AssemblyName>
-    <TargetFrameworkVersion>v4.8.1</TargetFrameworkVersion>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
     <ProjectTypeGuids>{60dc8134-eba5-43b8-bcc9-bb4bc16c2548};{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}</ProjectTypeGuids>
     <WarningLevel>4</WarningLevel>
@@ -16,7 +16,8 @@
     <Deterministic>true</Deterministic>
     <ApplicationIcon>ICO\SerialPort.ico</ApplicationIcon>
     <!-- 单一版本源：每次发布新版本只改这里（x.y.z），构建时自动生成程序集版本号 -->
-    <Version>1.1.4</Version>
+    <Version>1.1.5</Version>
+    <TargetFrameworkProfile />
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
     <PlatformTarget>AnyCPU</PlatformTarget>
@@ -173,9 +174,7 @@
         <_Parameter1>$(Version)</_Parameter1>
       </AssemblyAttributes>
     </ItemGroup>
-    <WriteCodeFragment Language="C#"
-                       OutputFile="$(IntermediateOutputPath)VersionInfo.cs"
-                       AssemblyAttributes="@(AssemblyAttributes)" />
+    <WriteCodeFragment Language="C#" OutputFile="$(IntermediateOutputPath)VersionInfo.cs" AssemblyAttributes="@(AssemblyAttributes)" />
     <ItemGroup>
       <Compile Include="$(IntermediateOutputPath)VersionInfo.cs" />
     </ItemGroup>
@@ -190,10 +189,7 @@
     <GetFileHash Files="$(TargetPath)" Algorithm="SHA256">
       <Output TaskParameter="Hash" PropertyName="_ExeSha256" />
     </GetFileHash>
-    <WriteLinesToFile File="$(TargetDir)$(TargetFileName).sha256"
-                      Lines="$(_ExeSha256.ToLowerInvariant()) $(TargetFileName)"
-                      Overwrite="true"
-                      Encoding="ASCII" />
+    <WriteLinesToFile File="$(TargetDir)$(TargetFileName).sha256" Lines="$(_ExeSha256.ToLowerInvariant()) $(TargetFileName)" Overwrite="true" Encoding="ASCII" />
   </Target>
   <!-- 注意：旧式 WPF 工程的标记编译依赖 VS 安装的 PresentationBuildTasks（.NET Framework 程序集），
        dotnet CLI 的 MSBuild 无法加载它，故本项目请用 VS 的 MSBuild.exe 构建（见 CLAUDE.md）。 -->

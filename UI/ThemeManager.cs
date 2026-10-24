@@ -14,7 +14,8 @@ namespace SerialPort.UI
     /// 主题管理器（WPF 版）：通过替换 App 级合并字典中的主题资源字典实现深浅主题切换。
     /// 所有引用主题颜色的控件样式均使用 DynamicResource，替换字典后自动刷新。
     /// 强调色（打开串口 / 发送按钮）不随主题变化，连接状态色由 MainWindow 维护。
-    /// 主题不持久化，程序启动恒为浅色（与源项目一致）。
+    /// 主题持久化到 Settings.Theme：切换时立即保存，App.OnStartup 启动时按保存值恢复。
+    /// XAML 中的合并字典初始恒为浅色，深色主题需在启动时替换字典才能生效。
     /// </summary>
     public static class ThemeManager
     {

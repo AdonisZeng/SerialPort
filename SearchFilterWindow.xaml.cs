@@ -1,3 +1,4 @@
+using System;
 using System.Windows;
 using System.Windows.Input;
 
@@ -40,6 +41,13 @@ namespace SerialPort
         {
             _main.ClearFilter();
             txtStatus.Text = "已清除筛选。";
+        }
+
+        /// <summary>搜索模式关闭窗口即结束本次查找：清除接收区高亮（筛选模式不动高亮）。</summary>
+        protected override void OnClosed(EventArgs e)
+        {
+            base.OnClosed(e);
+            if (!_filterMode) _main.ClearSearchHighlight();
         }
 
         private void BtnClose_Click(object sender, RoutedEventArgs e) => Close();

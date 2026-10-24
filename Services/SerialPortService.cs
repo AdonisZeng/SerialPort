@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
 using System.Threading;
+using System.Windows.Threading;
 
 // 本文件位于 namespace SerialPort.Services 内，根命名空间 SerialPort 会遮蔽
 // System.IO.Ports.SerialPort 类型（命名空间成员优先于 using 导入），故用别名引用。
@@ -29,14 +30,50 @@ namespace SerialPort.Services
         private MemoryStream _pendingData;         // 未提交的接收数据（非空 = 已有在途 Post 将取走）
         private SerialPortType _pendingPort;       // 数据所属端口实例（Post 后用于实例守卫）
 
-        /// <summary>攒批提交上限：超过后强制提交，防止 UI 长时间不投递时后台内存无界增长。</summary>
-        private const int PendingBatchMaxBytes = 64 * 1024;
+        // 发送队列：写操作可能被硬件流控阻塞到 WriteTimeout，必须在后台线程串行执行，
+        // 否则高频发送 / 设备不读时 UI 线程会整段冻结
+        private readonly object _sendLock = new object();
+        private readonly Queue<SendItem> _sendQueue = new Queue<SendItem>();
+        private int _sendQueueBytes;   // 队列中尚未写出的字节数（_sendLock 内维护）
+        private bool _writeInProgress; // 已出队、正在写出（_sendLock 内维护；排空判断需算上它）
+        private readonly AutoResetEvent _sendSignal = new AutoResetEvent(false);
+        private readonly Thread _sendThread;
+        private volatile bool _sendStopped;
+        private long _sentBytes;
+
+        /// <summary>攒批硬上限：超过后丢弃新到的数据块并上报，避免 UI 长时间停顿时后台内存无界增长。</summary>
+        private const int PendingBatchMaxBytes = 1024 * 1024;
+
+        /// <summary>
+        /// 发送队列字节上限。接收方向有攒批硬上限，发送方向没有天然的背压来源：
+        /// 改造前同步写在 UI 线程，写阻塞时界面卡住顺便"挡住"后续提交；改到后台线程后
+        /// 定时发送（间隔可低至 1 ms）叠加设备不读 / 硬件流控会让队列无界增长，
+        /// 故与接收同量级设上限，超限拒绝入队并上报。
+        /// </summary>
+        private const int SendQueueMaxBytes = 1024 * 1024;
+
+        /// <summary>
+        /// 队列元素：数据 + 写出成功后交给 UI 回显的文本。
+        /// 回显必须绑定到"真正写出"这一刻：入队即回显会让设备拔出 / 写超时的丢弃
+        /// 也显示成"已发送"，而写线程又无法在失败后纠正已经上屏的行。
+        /// </summary>
+        private sealed class SendItem
+        {
+            public byte[] Data;
+            public string Echo;
+        }
 
         /// <summary>当接收到数据时触发（已在 UI 线程上回调）。</summary>
         public event EventHandler<DataReceivedEventArgs> DataReceived;
 
         /// <summary>当串口打开/关闭状态变化时触发（在调用线程同步回调，非 Post 编组）。</summary>
         public event EventHandler<bool> ConnectionChanged;
+
+        /// <summary>
+        /// 数据真正写出后触发（已在 UI 线程回调），参数为提交时携带的回显文本（非空）。
+        /// 本地回显据此产生，保证"看到 [TX]"与"数据已离开本机"是同一件事。
+        /// </summary>
+        public event EventHandler<string> SendCompleted;
 
         /// <summary>
         /// 设备异常（拔出 / IO 错误 / 读写超时）时触发（已在 UI 线程回调），携带中文提示文本。
@@ -58,13 +95,25 @@ namespace SerialPort.Services
         /// <summary>当前端口名称（未连接时为空字符串；逻辑连接期间读取配置）。</summary>
         public string PortName => _config?.PortName ?? string.Empty;
 
+        /// <summary>累计真正写出的发送字节数（线程安全，供统计区读取）。</summary>
+        public long SentBytes => Interlocked.Read(ref _sentBytes);
+
+        /// <summary>复位发送字节统计。</summary>
+        public void ResetSentBytes() => Interlocked.Exchange(ref _sentBytes, 0);
+
         public SerialPortService()
         {
             // 端口实例不在构造时创建：每次 Open / TryReconnect 都通过 CreatePort 重建。
             // 设备拔出后旧实例的内部流会被自动关闭，复用同一实例打开不可靠，必须全新实例。
 
-            // 捕获当前同步上下文，用于把后台线程事件切回 UI 线程
-            _syncContext = SynchronizationContext.Current ?? new SynchronizationContext();
+            // 回退到创建线程的 Dispatcher 上下文：服务必须在 UI 线程构造，
+            // 直接用裸 SynchronizationContext 会把事件丢到线程池（跨线程访问控件）
+            _syncContext = SynchronizationContext.Current
+                ?? new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher);
+
+            // 写线程常驻：随进程退出（IsBackground），Dispose 时置停止标志并唤醒
+            _sendThread = new Thread(SendLoop) { IsBackground = true, Name = "SerialPortSend" };
+            _sendThread.Start();
         }
 
         /// <summary>获取系统中所有可用串口名称。</summary>
@@ -171,17 +220,61 @@ namespace SerialPort.Services
         /// <summary>
         /// 关闭串口。逻辑连接期间总是发出断开事件（设备已拔出时底层关闭可能失败，忽略）；
         /// 未连接时仅防御性清理，不发事件。
+        /// 关闭前给写线程一个短暂的排空窗口：用户"点发送后立刻关串口"时，队列里的数据
+        /// 通常能在几毫秒内写出；排不空的剩余部分丢弃并上报条数，避免静默丢失。
         /// </summary>
         public void Close()
         {
             if (_config == null)
             {
+                ClearSendQueue();
                 DisposePort();   // 防御性清理可能残留的物理端口
                 return;
             }
-            DisposePort();
+
+            WaitSendQueueDrained(TimeSpan.FromMilliseconds(300));
+            int discarded = ClearSendQueue();
+
+            // 先复位逻辑连接再释放端口：写线程此刻若因端口释放而失败，
+            // HandleDeviceError 会因 _config == null 静默忽略，
+            // 状态栏不会被"端口正在重建"之类的提示覆盖掉"已断开"
             _config = null;
+            DisposePort();
+
+            if (discarded > 0)
+                ReportDeviceError($"关闭串口：{discarded} 条待发数据未写出，已丢弃");
             ConnectionChanged?.Invoke(this, false);
+        }
+
+        /// <summary>等待发送队列排空（含正在写出的那一项），超时返回 false。</summary>
+        private bool WaitSendQueueDrained(TimeSpan timeout)
+        {
+            DateTime deadline = DateTime.UtcNow + timeout;
+            while (true)
+            {
+                lock (_sendLock)
+                {
+                    // 仅队列为空不够：最后一项可能已出队但仍阻塞在 Write 里
+                    if (_sendQueue.Count == 0 && !_writeInProgress) return true;
+                }
+                if (DateTime.UtcNow >= deadline) return false;
+                Thread.Sleep(5);
+            }
+        }
+
+        /// <summary>
+        /// 清空发送队列中尚未写出的数据并返回丢弃条数：关闭 / 释放时丢弃，否则下次打开
+        /// 会把上一次会话遗留的指令写到新端口（旧实现同步写，不存在跨会话残留）。
+        /// </summary>
+        private int ClearSendQueue()
+        {
+            lock (_sendLock)
+            {
+                int count = _sendQueue.Count;
+                _sendQueue.Clear();
+                _sendQueueBytes = 0;
+                return count;
+            }
         }
 
         /// <summary>
@@ -199,34 +292,101 @@ namespace SerialPort.Services
         }
 
         /// <summary>
-        /// 以字节数组发送数据。返回是否真正写出：
-        /// 逻辑未连接时抛异常；等待重插（物理断开）或设备异常时丢弃并返回 false。
-        /// 丢弃并非静默：会经 <see cref="DeviceError"/> 上报一次提示（已按时间节流）。
+        /// 提交数据到后台发送队列。返回是否被接受：
+        /// 逻辑未连接时抛异常；等待重插（物理断开）或队列已满时丢弃并返回 false（经 DeviceError 上报）；
+        /// 接受后由后台写线程按序写出，统计计入 <see cref="SentBytes"/>。
         /// 文本内容由调用方（MainWindow.SendText）先按当前编码转为字节后经此发送。
+        /// echoText：非空时在数据真正写出后经 <see cref="SendCompleted"/> 交回 UI 追加本地回显。
         /// </summary>
-        public bool SendBytes(byte[] data)
+        public bool SendBytes(byte[] data, string echoText = null)
         {
             if (_config == null) throw new InvalidOperationException("串口未连接。");
-            SerialPortType port = TryGetOpenPort();
-            if (port == null)
+            if (data == null || data.Length == 0) return false;
+            if (TryGetOpenPort() == null)
             {
-                // 物理未打开（设备拔出但 COM 号未消失 / 端口正在重建）：丢弃数据，
-                // 但仍上报一次——否则"设备异常不再静默"的改造在这条路径上被绕过，
-                // 定时发送会长时间空转而状态栏毫无提示（服务层已按时间节流，不会刷屏）
+                // 物理未打开但逻辑仍连接（设备拔出等待重插）：丢弃并提示，
+                // 否则定时发送会长时间空转而状态栏毫无反馈（服务层已按时间节流）
                 ReportDeviceError("设备未打开，本次数据已丢弃，等待重新连接");
                 return false;
             }
-            try
+
+            bool rejected = false;
+            lock (_sendLock)
             {
-                port.BaseStream.Write(data, 0, data.Length);
-                return true;
+                // 队列已满（设备写入受阻）：拒绝新数据而不是丢弃最旧的——
+                // 已入队的数据是用户先发的，丢掉会让设备收到乱序/不完整的指令流
+                if (_sendQueueBytes + data.Length > SendQueueMaxBytes)
+                    rejected = true;
+                else
+                {
+                    _sendQueue.Enqueue(new SendItem { Data = data, Echo = echoText });
+                    _sendQueueBytes += data.Length;
+                }
             }
-            catch (Exception ex)
+            if (rejected)
             {
-                // 设备拔出（COM 号复用等）时写入抛 IO 类异常：丢弃并由 HandleDeviceError 上报，
-                // 由 UI 定时器负责重连
-                if (HandleDeviceError(ex)) return false;
-                throw;
+                // 由写线程阻塞导致，提示里要说明是"设备写入受阻"而不是格式或连接问题
+                ReportDeviceError("发送缓冲已满（设备写入受阻），本次数据已丢弃");
+                return false;
+            }
+            _sendSignal.Set();
+            return true;
+        }
+
+        /// <summary>
+        /// 后台写线程：按入队顺序写出数据。写入失败不得抛出（后台线程崩溃会带走进程），
+        /// 统一走 HandleDeviceError 上报并经 DeviceError 提示状态栏。
+        /// 只有真正写出才累计字节并触发回显：写失败 / 关闭竞态下的丢弃不会留下"已发送"痕迹。
+        /// </summary>
+        private void SendLoop()
+        {
+            while (!_sendStopped)
+            {
+                _sendSignal.WaitOne();
+                while (!_sendStopped)
+                {
+                    SendItem item;
+                    lock (_sendLock)
+                    {
+                        if (_sendQueue.Count == 0) break;
+                        item = _sendQueue.Dequeue();
+                        _sendQueueBytes -= item.Data.Length;
+                        _writeInProgress = true;
+                    }
+
+                    try
+                    {
+                        SerialPortType port = TryGetOpenPort();
+                        if (port == null)
+                        {
+                            if (_config != null)
+                            {
+                                // 物理已断开（拔出等待重插）：丢弃并提示，重连后用户再次发送即可。
+                                // 手动关闭时 _config 已复位，剩余数据由 Close 统一上报条数，这里不重复
+                                ReportDeviceError("设备未打开，本次数据已丢弃，等待重新连接");
+                            }
+                            continue;
+                        }
+                        port.BaseStream.Write(item.Data, 0, item.Data.Length);
+                        Interlocked.Add(ref _sentBytes, item.Data.Length);
+                        if (!string.IsNullOrEmpty(item.Echo))
+                        {
+                            string echo = item.Echo;
+                            Post(() => SendCompleted?.Invoke(this, echo));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // 关闭竞态（_config 已复位）下的写失败属预期：静默，避免覆盖"已断开"
+                        if (_config == null) continue;
+                        if (!HandleDeviceError(ex))
+                            ReportDeviceError("发送失败：" + ex.Message);
+                    }
+                    finally
+                    {
+                        lock (_sendLock) _writeInProgress = false;
+                    }
+                }
             }
         }
 
@@ -275,6 +435,7 @@ namespace SerialPort.Services
 
                 // 攒批：已有同实例的在途批则只追加数据（由该批的 Flush 统一提交），否则开新批并 Post
                 bool postFlush = false;
+                bool overflowDropped = false;
                 lock (_pendingLock)
                 {
                     if (_pendingData == null || !ReferenceEquals(_pendingPort, port))
@@ -282,13 +443,15 @@ namespace SerialPort.Services
                         // 开始新批（不同实例的旧批由 Flush 时的实例守卫丢弃）
                         _pendingData = new MemoryStream();
                         _pendingPort = port;
-                        postFlush = true;
+                        postFlush = true;   // 同一批只需一次在途 Post，后续追加不必重复投递
                     }
-                    _pendingData.Write(buffer, 0, buffer.Length);
-                    // 超过攒批上限：强制提交（在途 Flush 会取走整批，本次新 Post 的 Flush 为空返回）
-                    if (_pendingData.Length > PendingBatchMaxBytes) postFlush = true;
+                    if (_pendingData.Length + buffer.Length <= PendingBatchMaxBytes)
+                        _pendingData.Write(buffer, 0, buffer.Length);
+                    else
+                        overflowDropped = true;   // 硬上限：丢弃本块，保证后台内存有界
                 }
                 if (postFlush) Post(FlushPendingData);
+                if (overflowDropped) ReportDeviceError("接收缓冲溢出，部分数据已丢弃");
             }
             catch (Exception ex)
             {
@@ -364,13 +527,28 @@ namespace SerialPort.Services
             Post(() => DeviceError?.Invoke(this, text));
         }
 
-        /// <summary>把动作切回 UI 线程执行（后台线程事件回调统一走此入口）。</summary>
-        private void Post(Action action) => _syncContext.Post(_ => action(), null);
+        /// <summary>
+        /// 把动作切回 UI 线程执行（后台线程事件回调统一走此入口）。
+        /// 关窗后调度器可能已关闭（BeginInvoke 抛 InvalidOperationException），
+        /// 此时事件已无人消费，静默丢弃；只收窄捕获该异常，其余异常照常暴露。
+        /// </summary>
+        private void Post(Action action)
+        {
+            try { _syncContext.Post(_ => action(), null); }
+            catch (InvalidOperationException) { }   // 调度器已关闭：事件已无人消费
+        }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
+
+            // 先置停止标志再释放端口：否则写线程可能在端口释放后仍去写。
+            // 不 Join：写可能正被硬件流控阻塞在 WriteTimeout 上，Join 会拖住关窗退出；
+            // 写线程为 IsBackground，进程退出时由运行时回收，_sendSignal 同样无需释放。
+            _sendStopped = true;
+            _sendSignal.Set();
+
             _config = null;   // 逻辑连接复位（不触发事件：窗口已关闭）
             DisposePort();
         }

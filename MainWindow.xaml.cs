@@ -36,7 +36,6 @@ namespace SerialPort
         private QuickCommandWindow _quickWindow;  // 快捷指令窗口（单实例：多开时各自的命令列表会互相覆盖）
         private bool _loadingSettings;   // 构造函数恢复配置期间抑制即时保存（控件赋值会触发变更事件）
         private long _receivedBytesTotal;
-        private long _sentBytesTotal;   // 累计发送字节数
         private long _lastStatsRx;      // 上次统计快照的接收字节（计算速率）
         private long _lastStatsTx;      // 上次统计快照的发送字节（计算速率）
         private DateTime _connectStartedAt;   // 当前连接开始时间（断开后统计区显示 --:--:--）
@@ -69,9 +68,6 @@ namespace SerialPort
         private List<ReceiveLine> _pausedLines = new List<ReceiveLine>();
         private int _pausedChars;               // 暂停缓冲字符合计（容量核算）
         private ReceiveLine _pausedPendingItem; // 暂停缓冲中对应"未完成行"的实时条目
-
-        // 未完成行的待保存片段：行完成时拼在行文本前写盘，保证文件内容与接收顺序一致
-        private string _saveCarry = string.Empty;
 
         // 搜索状态（接收区查找）
         private string _searchTerm;
@@ -177,6 +173,7 @@ namespace SerialPort
             _service.DataReceived += OnDataReceived;
             _service.ConnectionChanged += OnConnectionChanged;
             _service.DeviceError += OnDeviceError;   // 设备异常（拔出 / IO 错误 / 超时）→ 状态栏提示
+            _service.SendCompleted += OnSendCompleted;   // 数据真正写出后才追加 [TX] 回显
 
             // 接收管线：组装器产出完整行 → 批量入虚拟化集合
             _assembler.LineCompleted += OnAssemblerLineCompleted;
@@ -417,7 +414,7 @@ namespace SerialPort
         /// 设备描述由 <see cref="ScheduleDescriptionBackfill"/> 查完后经
         /// <see cref="ApplyDescriptionsInPlace"/> 就地回填。
         /// 选中恢复规则：优先保留当前选中（用户可能已手动改选）；
-        /// 失效且未连接时选第一个 / 清空；已连接（端口仍在列表中）不强制改选。
+        /// 失效且已连接时回落到当前连接端口；失效且未连接时选第一个 / 清空。
         /// </summary>
         private void RebuildPortItems(string[] ports)
         {
@@ -430,9 +427,15 @@ namespace SerialPort
             int keepIndex = keep != null ? Array.IndexOf(ports, keep) : -1;
             if (keepIndex >= 0)
                 cboPortName.SelectedIndex = keepIndex;   // 保留当前选中项
-            else if (!_service.IsConnected)
+            else if (_service.IsConnected)
+            {
+                // 已连接但原选中项消失（拔插后重建列表）：回落到当前连接端口，
+                // 否则下拉呈空选中，用户看不到正在使用哪个端口
+                int connectedIndex = Array.IndexOf(ports, _service.PortName);
+                if (connectedIndex >= 0) cboPortName.SelectedIndex = connectedIndex;
+            }
+            else
                 cboPortName.SelectedIndex = ports.Length > 0 ? 0 : -1;   // 选中项消失且未连接 → 选第一个 / 清空
-            // 串口已打开：不强制改选、不动连接
         }
 
         /// <summary>集合比较（GetPortNames 顺序不稳，用存在性判断而非按下标；只比较端口名，不分配临时数组）。</summary>
@@ -518,6 +521,7 @@ namespace SerialPort
             else
             {
                 _awaitingDevice = false;   // 手动关闭等：解除冻结，恢复列表刷新
+                _frameWindow?.FlushPendingFrame();   // 帧头定界模式的末帧无帧尾，断开时补输出
                 UpdateStatus("已断开");
             }
         }
@@ -641,23 +645,18 @@ namespace SerialPort
         /// <summary>组装器回调：一行完成 → 写盘 + 进批次（批次在块尾统一入集合）。</summary>
         private void OnAssemblerLineCompleted(string line)
         {
-            EmitCompletedLine(line, false);
+            EmitCompletedLine(line);
         }
 
         /// <summary>
-        /// 完整行入管线：保存 + 加入行批次。接收行会把"未完成行待保存片段"（_saveCarry）拼在行前写入，
-        /// 保证文件内容顺序与真实接收一致；发送回显行独立成行，不消费该片段（片段仍归未完成行）。
+        /// 接收完整行入管线：保存 + 加入行批次。组装器传出的是整行（已含未完成阶段累积的文本），
+        /// 因此只按行写盘，不再拼"未完成行片段"——否则跨块行在文件里会重复前缀、双重时间戳。
+        /// 发送回显不走这里（`AppendLocalEcho` 自成一行、独立写盘），故无方向参数。
         /// </summary>
-        private void EmitCompletedLine(string line, bool isTx)
+        private void EmitCompletedLine(string line)
         {
-            string formatted = FormatLine(line, isTx);
-            if (isTx)
-                EnqueueSaveText(formatted + "\r\n");
-            else
-            {
-                EnqueueSaveText(_saveCarry + formatted + "\r\n");   // 保存内容与显示一致（含前缀与时间戳）
-                _saveCarry = string.Empty;
-            }
+            string formatted = FormatLine(line, false);
+            EnqueueSaveText(formatted + "\r\n");   // 保存内容与显示一致（含前缀与时间戳）
             _batchLines.Add(formatted);
         }
 
@@ -667,7 +666,6 @@ namespace SerialPort
             FlushBatchLines();
 
             string formattedPending = FormatLine(_assembler.PendingText, false);
-            _saveCarry = formattedPending;   // 未完成行片段待行完成时拼入文件
 
             if (chkPauseReceive.IsChecked == true)
             {
@@ -683,7 +681,7 @@ namespace SerialPort
                 }
                 else
                 {
-                    _pausedPendingItem.Text = formattedPending;
+                    SetPausedPendingText(formattedPending);
                 }
                 TrimPausedLines();
                 return;
@@ -729,7 +727,7 @@ namespace SerialPort
                     if (_pausedPendingItem != null)
                     {
                         // 第一行并入未完成行条目（整行替换部分行），保持内容连续
-                        _pausedPendingItem.Text = _batchLines[i];
+                        SetPausedPendingText(_batchLines[i]);
                         _pausedPendingItem = null;
                     }
                     else
@@ -792,6 +790,10 @@ namespace SerialPort
                 remove++;
             }
             _receiveLines.RemoveFromHead(remove);
+            // 截头可能把正在原位更新的未完成行一并移出集合：条目已失效则置空，
+            // 下个数据块会重建（否则 SetText 因 IndexOf 返回 -1 静默跳过，显示永久冻结）
+            if (_pendingItem != null && _receiveLines.IndexOf(_pendingItem) < 0)
+                _pendingItem = null;
         }
 
         /// <summary>暂停缓冲追加一行（含字符计数）。</summary>
@@ -799,6 +801,15 @@ namespace SerialPort
         {
             _pausedLines.Add(line);
             _pausedChars += line.Text.Length + 2;
+        }
+
+        /// <summary>原位更新暂停缓冲中的未完成行条目，同步维护字符合计
+        /// （否则容量核算低估，暂停缓冲实际可越过上限）。</summary>
+        private void SetPausedPendingText(string text)
+        {
+            if (_pausedPendingItem == null) return;
+            _pausedChars += text.Length - _pausedPendingItem.Text.Length;
+            _pausedPendingItem.Text = text;
         }
 
         /// <summary>暂停缓冲容量截头（与接收区同阈值，防止长时间暂停内存无界增长）。</summary>
@@ -834,26 +845,30 @@ namespace SerialPort
             return sum;
         }
 
-        /// <summary>关窗兜底：把未完成行写入保存文件（随后 DisposeSaveWriter 排空队列并释放）。</summary>
+        /// <summary>关窗兜底：把未完成行写入保存文件（仅补写一次，随后 DisposeSaveWriter 排空队列并释放）。</summary>
         private void FlushPendingLineForSave()
         {
             string pending = FormatLine(_assembler.PendingText, false);
-            if (pending.Length > 0) EnqueueSaveText(_saveCarry + pending + "\r\n");
-            _saveCarry = string.Empty;
+            if (pending.Length > 0) EnqueueSaveText(pending + "\r\n");
         }
 
         /// <summary>1 秒统计刷新：累计接收/发送字节、双向实时速率、连接时长（UI 线程定时器）。</summary>
         private void TimerStats_Tick(object sender, EventArgs e)
         {
             long rx = _receivedBytesTotal;
-            long tx = _sentBytesTotal;
+            long tx = _service.SentBytes;   // 发送计数由服务维护（仅统计真正写出的字节）
             double rxKb = (rx - _lastStatsRx) / 1024.0;
             double txKb = (tx - _lastStatsTx) / 1024.0;
             _lastStatsRx = rx;
             _lastStatsTx = tx;
-            string duration = _service.IsConnected
-                ? DateTime.Now.Subtract(_connectStartedAt).ToString(@"hh\:mm\:ss")
-                : "--:--:--";
+            string duration = "--:--:--";
+            if (_service.IsConnected)
+            {
+                TimeSpan elapsed = DateTime.Now.Subtract(_connectStartedAt);
+                // 超过 1 天时把天数并入格式，否则 hh 只取 24 小时内的部分（长连接时长会"回绕"变小）
+                duration = elapsed.ToString(
+                    elapsed.TotalDays >= 1 ? @"d\.hh\:mm\:ss" : @"hh\:mm\:ss");
+            }
             txtStats.Text = $"累计收 {rx} B / 发 {tx} B　|　↓ {rxKb:F1} KB/s　↑ {txKb:F1} KB/s　|　连接 {duration}";
         }
 
@@ -911,14 +926,54 @@ namespace SerialPort
             return sb.ToString().TrimEnd();
         }
 
-        /// <summary>本地回显：勾选后把发送内容以 [TX] 前缀追加到接收区（与接收数据同管线，含时间戳与文件保存）。</summary>
+        /// <summary>
+        /// 本地回显：把已真正写出的发送内容以 [TX] 前缀追加到接收区（含时间戳与文件保存）。
+        /// 由 <see cref="OnSendCompleted"/> 触发——回显必须晚于"数据离开本机"，
+        /// 入队即回显会让设备拔出 / 写超时导致的丢弃也显示成已发送。
+        /// 独立于接收批次：TX 行不是任何未完成接收行的完成态，一旦进入 _batchLines，
+        /// 批次首行合并逻辑会把它当作未完成接收行整行替换，导致半行内容被 TX 文本覆盖。
+        /// 因此这里直接写盘并自行入集合 / 暂停缓冲 / 筛选缓冲。
+        /// </summary>
         private void AppendLocalEcho(string content)
         {
             if (chkLocalEcho.IsChecked != true) return;
             string text = content.TrimEnd('\r', '\n');
             if (text.Length == 0) return;
-            EmitCompletedLine(text, true);   // 回显内容自成一行，独立于未完成行
-            OnAssemblerPendingUpdated();     // 立即入集合（不等待下一个接收数据块）
+            string formatted = FormatLine(text, true);
+            EnqueueSaveText(formatted + "\r\n");
+
+            if (chkPauseReceive.IsChecked == true)
+            {
+                PausedAddLine(new ReceiveLine(formatted));
+                TrimPausedLines();
+            }
+            else if (_filterState != null)
+            {
+                // 与接收行一致：先记全量缓冲，仅匹配项上屏
+                _filterState.Lines.Add(new ReceiveLine(formatted));
+                _filterState.CharCount += formatted.Length + 2;
+                TrimFilterBuffer();
+                if (MatchesFilter(formatted)) _receiveLines.AddLine(formatted);
+                TrimDisplay();
+            }
+            else
+            {
+                _receiveLines.AddLine(formatted);
+                TrimDisplay();
+            }
+
+            if (chkAutoScroll.IsChecked == true && _receiveLines.Count > 0)
+                lstReceive.ScrollIntoView(_receiveLines[_receiveLines.Count - 1]);
+        }
+
+        /// <summary>
+        /// 服务层回调：数据已真正写出（已在 UI 线程），此时才追加本地回显。
+        /// 回显内容由提交时随数据一起传给服务，写线程写出成功后原样交回，
+        /// 因此顺序与真正发出的顺序一致，被丢弃的数据不会留下 [TX] 行。
+        /// </summary>
+        private void OnSendCompleted(object sender, string echoText)
+        {
+            AppendLocalEcho(echoText);
         }
 
         // ============================================================
@@ -935,7 +990,8 @@ namespace SerialPort
         }
 
         /// <summary>
-        /// 发送界面文本：按当前模式（hex/文本、追加换行、编码）解析并发送，累计发送字节统计。
+        /// 发送界面文本：按当前模式（hex/文本、追加换行、编码）解析并提交发送，
+        /// 发送字节由服务层计数、回显由服务层在真正写出后回调（均只对真正写出的数据生效）。
         /// 发送按钮、定时发送、快捷指令共用此入口；hex 解析失败时弹窗提示并返回 false。
         /// </summary>
         internal bool SendText(string text)
@@ -950,15 +1006,13 @@ namespace SerialPort
                 if (chkSendHex.IsChecked == true)
                 {
                     byte[] bytes = HexStringToBytes(text);
-                    // 只在真正写出时累计：设备拔出等待重连期间数据被丢弃，不应计入发送统计
-                    if (_service.SendBytes(bytes)) _sentBytesTotal += bytes.Length;
-                    AppendLocalEcho(FormatHex(bytes));
+                    // 回显文本随数据一起入队，写出成功后才回显（丢弃 / 超时不留 [TX] 痕迹）
+                    _service.SendBytes(bytes, FormatHex(bytes));
                 }
                 else
                 {
                     byte[] bytes = _textEncoding.GetBytes(text);   // 编码一次：字节数直接取自数组，不再二次 GetByteCount
-                    if (_service.SendBytes(bytes)) _sentBytesTotal += bytes.Length;
-                    AppendLocalEcho(text);
+                    _service.SendBytes(bytes, text);
                 }
                 return true;
             }
@@ -1095,11 +1149,13 @@ namespace SerialPort
         {
             _receivedBytesTotal = 0;
             _lastStatsRx = 0;   // 速率快照同步复位，避免清空后速率虚高
+            // 清空接收区同时复位双侧统计：发送计数由服务维护，这里一并清零并同步速率快照
+            _service.ResetSentBytes();
+            _lastStatsTx = 0;
             _textDecoder.Reset();   // 视觉清空后解码状态同步复位，避免新数据开头残留乱码
             // 行管线与各缓冲全部复位，保证清空后显示 / 保存 / 搜索 / 筛选状态一致
             _assembler.Reset();
             _batchLines.Clear();
-            _saveCarry = string.Empty;
             _pendingItem = null;
             _pausedLines.Clear();
             _pausedChars = 0;
@@ -1218,6 +1274,14 @@ namespace SerialPort
             SearchHighlight.SetBrush(this, TryFindResource("SearchHighlightBrush") as Brush);
         }
 
+        /// <summary>清除搜索状态与高亮（搜索窗口关闭时调用，避免高亮残留在接收区）。</summary>
+        internal void ClearSearchHighlight()
+        {
+            _searchTerm = null;
+            _searchPos = null;
+            SearchHighlight.SetTerm(this, string.Empty);
+        }
+
         /// <summary>接收区 Ctrl+C：复制选中行文本（按行序拼接，每行一行；Ctrl+A 全选为 ListBox 默认行为）。</summary>
         private void LstReceive_PreviewKeyDown(object sender, KeyEventArgs e)
         {
@@ -1249,11 +1313,13 @@ namespace SerialPort
             }
             if (_filterState == null)
             {
-                // 首次启用：以当前显示行作为全量缓冲快照（此后新数据同时记入缓冲）
+                // 首次启用：以当前已完成行作为全量缓冲快照（此后新数据同时记入缓冲）。
+                // 未完成行不能入选：它完成时整行还会再进一次缓冲，否则出现半行 + 整行重复
                 _filterState = new FilterState();
                 foreach (ReceiveLine line in _receiveLines)
-                    _filterState.Lines.Add(line);
-                _filterState.CharCount = _receiveLines.TotalChars;
+                    if (!ReferenceEquals(line, _pendingItem)) _filterState.Lines.Add(line);
+                _filterState.CharCount = _receiveLines.TotalChars
+                    - (_pendingItem == null ? 0 : _pendingItem.Text.Length + 2);
             }
             _filterState.Term = term;
             _filterState.MatchCase = matchCase;
@@ -1337,7 +1403,10 @@ namespace SerialPort
             if (chkSaveFile.IsChecked == true)
             {
                 if (_loadingSettings)
+                {
                     _saveFilePending = true;   // 启动恢复勾选：不立即建文件，首次数据到达时惰性创建
+                    UpdateFileEditState(false);   // 启动时未连接且尚无文件：改名按钮保持禁用
+                }
                 else
                     StartSaveFile();
             }
@@ -1470,12 +1539,15 @@ namespace SerialPort
             if (chkSaveFile.IsChecked == true) TryOpenSaveWriter(_saveFilePath);
         }
 
-        /// <summary>文件名编辑状态：未勾选文件保存或串口已打开时均禁止修改文件名。</summary>
+        /// <summary>文件名编辑状态：未勾选文件保存、串口已打开或尚无保存文件时均禁止修改文件名。</summary>
         private void UpdateFileEditState(bool connected)
         {
             bool saveChecked = chkSaveFile.IsChecked == true;
-            txtSaveFileName.IsReadOnly = !saveChecked || connected;
-            btnModifyFileName.IsEnabled = saveChecked && !connected;
+            // 尚无保存文件（启动恢复勾选、首次数据未到）时文件名没有可改的对象：
+            // 此刻放开编辑只会让输入内容在建立文件时被默认文件名覆盖
+            bool hasFile = !string.IsNullOrEmpty(_saveFilePath);
+            txtSaveFileName.IsReadOnly = !saveChecked || connected || !hasFile;
+            btnModifyFileName.IsEnabled = saveChecked && !connected && hasFile;
         }
 
         /// <summary>把接收文本加入后台写盘队列（写盘不阻塞 UI 线程；队列空则启动排空任务）。</summary>

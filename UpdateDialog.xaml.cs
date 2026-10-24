@@ -158,6 +158,14 @@ namespace SerialPort
 
         private void OnUpdateProgress(object sender, int percent)
         {
+            // -1 = 服务端未返回 Content-Length：进度不可知，用不确定进度条代替固定百分比
+            if (percent < 0)
+            {
+                progressBar.IsIndeterminate = true;
+                txtProgress.Text = "正在下载…（大小未知）";
+                return;
+            }
+            progressBar.IsIndeterminate = false;
             progressBar.Value = percent;
             txtProgress.Text = $"正在下载… {percent}%";
         }
