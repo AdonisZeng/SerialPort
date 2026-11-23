@@ -139,8 +139,10 @@ namespace SerialPort.Services
             }
             if (old == null) return;
             old.DataReceived -= OnSerialDataReceived;
-            try { if (old.IsOpen) old.Close(); } catch { }
-            try { old.Dispose(); } catch { }
+            try { if (old.IsOpen) old.Close(); }
+            catch (Exception ex) { LogService.Warn("关闭旧端口实例时异常（忽略）。", ex); }
+            try { old.Dispose(); }
+            catch (Exception ex) { LogService.Warn("释放旧端口实例时异常（忽略）。", ex); }
         }
 
         /// <summary>清理旧实例并创建新实例（默认超时 / DTR，挂接接收事件）。</summary>
@@ -185,13 +187,15 @@ namespace SerialPort.Services
             {
                 port.Open();
             }
-            catch
+            catch (Exception ex)
             {
                 // 打开失败：清理新建实例，保持未连接，异常抛给调用方
+                LogService.Error($"打开串口失败：{config.PortName} @ {config.BaudRate}", ex);
                 DisposePort();
                 throw;
             }
             _config = config;
+            LogService.Info($"串口已打开：{config.PortName} @ {config.BaudRate}，数据位={config.DataBits}，停止位={config.StopBits}，校验={config.Parity}，流控={config.Handshake}");
             ConnectionChanged?.Invoke(this, true);
         }
 
@@ -208,10 +212,12 @@ namespace SerialPort.Services
             try
             {
                 port.Open();
+                LogService.Info($"串口自动重连成功：{_config.PortName} @ {_config.BaudRate}");
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                LogService.Warn($"串口自动重连失败：{_config.PortName} @ {_config.BaudRate}", ex);
                 DisposePort();
                 return false;
             }
@@ -243,6 +249,7 @@ namespace SerialPort.Services
 
             if (discarded > 0)
                 ReportDeviceError($"关闭串口：{discarded} 条待发数据未写出，已丢弃");
+            LogService.Info("串口已关闭。");
             ConnectionChanged?.Invoke(this, false);
         }
 
@@ -306,6 +313,7 @@ namespace SerialPort.Services
             {
                 // 物理未打开但逻辑仍连接（设备拔出等待重插）：丢弃并提示，
                 // 否则定时发送会长时间空转而状态栏毫无反馈（服务层已按时间节流）
+                LogService.Warn("设备未打开（等待重插），本次发送数据已丢弃。");
                 ReportDeviceError("设备未打开，本次数据已丢弃，等待重新连接");
                 return false;
             }
@@ -326,6 +334,7 @@ namespace SerialPort.Services
             if (rejected)
             {
                 // 由写线程阻塞导致，提示里要说明是"设备写入受阻"而不是格式或连接问题
+                LogService.Warn($"发送缓冲已满（上限 {SendQueueMaxBytes} 字节），本次 {data.Length} 字节数据已丢弃。");
                 ReportDeviceError("发送缓冲已满（设备写入受阻），本次数据已丢弃");
                 return false;
             }
@@ -381,6 +390,7 @@ namespace SerialPort.Services
                         if (_config == null) continue;
                         if (!HandleDeviceError(ex))
                             ReportDeviceError("发送失败：" + ex.Message);
+                        LogService.Error($"发送失败（{item.Data.Length} 字节）", ex);
                     }
                     finally
                     {
@@ -451,13 +461,18 @@ namespace SerialPort.Services
                         overflowDropped = true;   // 硬上限：丢弃本块，保证后台内存有界
                 }
                 if (postFlush) Post(FlushPendingData);
-                if (overflowDropped) ReportDeviceError("接收缓冲溢出，部分数据已丢弃");
+                if (overflowDropped)
+                {
+                    LogService.Warn($"接收缓冲超过 {PendingBatchMaxBytes} 字节上限，本块数据已丢弃。");
+                    ReportDeviceError("接收缓冲溢出，部分数据已丢弃");
+                }
             }
             catch (Exception ex)
             {
                 // 设备拔出（COM 号被复用等）时读取抛 IO 类异常：静默丢弃，由 UI 定时器自动重连
                 HandleDeviceError(ex);
-                // 其余异常静默处理，避免后台线程崩溃
+                // 其余异常静默处理，避免后台线程崩溃（但必须留痕：否则问题无从追溯）
+                LogService.Error("接收数据回调异常", ex);
             }
         }
 
@@ -496,6 +511,8 @@ namespace SerialPort.Services
                 || ex is InvalidOperationException    // 端口正在被关闭/重建（流已释放）时的写竞态
                 || ex is TimeoutException))           // 设备无响应：读/写超时
                 return false;
+            // 状态栏只有一句中文提示，原始异常类型与堆栈必须留存在日志里
+            LogService.Warn($"设备异常（{DescribeDeviceError(ex)}）", ex);
             ReportDeviceError(DescribeDeviceError(ex));
             return true;
         }

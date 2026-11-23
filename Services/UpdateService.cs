@@ -100,16 +100,21 @@ namespace SerialPort.Services
                         result = FetchLatestRelease();
                         WriteCache(result);        // 缓存最新结果（含"已是最新"状态），写失败静默忽略
                     }
+                    LogService.Info(result.IsUpdateAvailable
+                        ? $"检查更新完成：发现新版本 v{result.LatestVersion}（当前 v{result.CurrentVersion}）。"
+                        : $"检查更新完成：当前已是最新版本 v{result.CurrentVersion}。");
                     if (!notifyWhenUpToDate && !result.IsUpdateAvailable && result.LatestVersion == null)
                         return;   // 自动检查且仓库无 Release：静默
                     Post(() => CheckCompleted?.Invoke(this, result));
                 }
                 catch (RateLimitExceededException ex)
                 {
+                    LogService.Error("检查更新失败：GitHub 访问频率受限。", ex);
                     Post(() => UpdateError?.Invoke(this, "GitHub 访问频率受限（rate limit exceeded），" + ex.Message + "。"));
                 }
-                catch (HttpRequestException)
+                catch (HttpRequestException ex)
                 {
+                    LogService.Error("检查更新失败：无法连接到 GitHub。", ex);
                     Post(() => UpdateError?.Invoke(this, "检查更新失败：无法连接到 GitHub，请检查网络后重试。"));
                 }
                 catch (Exception raw)
@@ -123,6 +128,7 @@ namespace SerialPort.Services
                     string message = ex is TaskCanceledException
                         ? "检查更新超时（" + (int)CheckTimeout.TotalSeconds + " 秒），请检查网络后重试。"
                         : "检查更新失败：" + ex.Message;
+                    LogService.Error("检查更新失败。", ex);
                     Post(() => UpdateError?.Invoke(this, message));
                 }
                 finally
@@ -242,12 +248,14 @@ namespace SerialPort.Services
                     string message = token.IsCancellationRequested
                         ? "更新已取消。"
                         : "更新下载超时，请检查网络后重试。";
+                    LogService.Info("更新流程结束：" + message);
                     Post(() => UpdateError?.Invoke(this, message));
                 }
                 catch (Exception ex)
                 {
                     // 失败同样清理临时目录，不留半下载的残留文件
                     TryDeleteWorkDir(newExe);
+                    LogService.Error("更新失败。", ex);
                     Post(() => UpdateError?.Invoke(this, "更新失败：" + ex.Message));
                 }
             });

@@ -240,11 +240,13 @@ namespace SerialPort
                             _reconnectFailures = 0;
                             _connectStartedAt = DateTime.Now;   // 重连后重新计时：物理断开期不计入连接时长
                             ApplyPinStates();   // 重连重建了端口实例：按当前勾选重写引脚
+                            LogService.Info($"检测到 {_service.PortName} 已重新连接。");
                             UpdateStatus($"检测到 {_service.PortName} 已重新连接");
                         }
                         else if (++_reconnectFailures == 10)
                         {
                             // 连续重连失败（端口被占用等）：提示一次，继续每轮静默重试
+                            LogService.Warn($"串口 {_service.PortName} 连续重连失败 10 次，请检查端口是否被其他程序占用。");
                             UpdateStatus("重连失败，请检查端口是否被其他程序占用");
                         }
                     }
@@ -257,6 +259,7 @@ namespace SerialPort
                 {
                     // 首次检测到端口消失：置位冻结标志并提示一次（不刷屏）
                     _awaitingDevice = true;
+                    LogService.Warn($"检测到串口 {_service.PortName} 已拔出，等待重新插入。");
                     UpdateStatus($"检测到 {_service.PortName} 已拔出，等待重新插入…");
                 }
             }
@@ -338,9 +341,10 @@ namespace SerialPort
                     string[] ports = SerialPortService.GetAvailablePorts();
                     lock (_portsLock) _lastPorts = ports;
                 }
-                catch
+                catch (Exception ex)
                 {
                     // 枚举失败（极罕见）：保留上一次快照，下轮重试，后台线程不留下未处理异常
+                    LogService.Warn("枚举串口失败（保留上一次快照，下轮重试）。", ex);
                 }
                 Thread.Sleep(PortScanInterval);
             }
@@ -370,7 +374,12 @@ namespace SerialPort
             {
                 // 先判故障：直接读 t.Result 会在任务异常时抛 AggregateException，
                 // 且该异常无人观察（ContinueWith 的返回任务被丢弃），等于静默吞错
-                if (t.IsFaulted || t.IsCanceled || t.Result == null) return;
+                if (t.IsFaulted || t.IsCanceled)
+                {
+                    LogService.Warn("查询串口设备描述失败。", t.Exception);
+                    return;
+                }
+                if (t.Result == null) return;
                 if (!PortListEquals(ports)) return;   // 集合已变化：丢弃本次结果
                 ApplyDescriptionsInPlace(t.Result);
             }, TaskScheduler.FromCurrentSynchronizationContext());
@@ -492,6 +501,8 @@ namespace SerialPort
             }
             catch (Exception ex)
             {
+                // 打开失败：记录完整异常（弹窗只有一句提示，无法据此定位问题）
+                LogService.Error($"打开串口失败：{item.PortName}", ex);
                 MessageBox.Show($"打开串口失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
@@ -500,7 +511,12 @@ namespace SerialPort
         /// 设备异常提示（服务已节流：同一文本 2 秒内最多一次）。
         /// 只写状态栏不弹窗：串口高频收发时错误可能每秒成百上千次，弹窗会刷屏。
         /// </summary>
-        private void OnDeviceError(object sender, string message) => UpdateStatus(message);
+        private void OnDeviceError(object sender, string message)
+        {
+            // 状态栏只显示一句提示，原始异常已在服务层写入日志
+            LogService.Warn("设备错误提示：" + message);
+            UpdateStatus(message);
+        }
 
         private void OnConnectionChanged(object sender, bool connected)
         {
@@ -1019,6 +1035,7 @@ namespace SerialPort
             catch (Exception ex)
             {
                 // 设备拔出等待重连期间的发送已在服务层静默丢弃，这里只报告其余错误
+                LogService.Error("发送失败。", ex);
                 MessageBox.Show($"发送失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
                 return false;
             }
@@ -1075,6 +1092,7 @@ namespace SerialPort
                 _timerGen++;   // 代次递增：旧线程（可能在 Sleep 中）醒来后立即退出
                 btnTimerSend.Content = "定时发送";
                 UpdateStatus("已停止定时发送");
+                LogService.Info("定时发送已停止。");
                 return;
             }
             if (!_service.IsConnected)
@@ -1092,6 +1110,7 @@ namespace SerialPort
             int gen = ++_timerGen;
             btnTimerSend.Content = "停止定时";
             UpdateStatus($"定时发送已启动：每 {interval} ms");
+            LogService.Info($"定时发送已启动：间隔 {interval} ms。");
             var thread = new Thread(() => TimerSendLoop(interval, gen)) { IsBackground = true };
             thread.Start();
         }
@@ -1122,9 +1141,10 @@ namespace SerialPort
                     Thread.Sleep(interval);
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // 窗口关闭 / 应用退出时 Invoke 可能抛异常：静默退出（后台线程不留下未处理异常）
+                LogService.Warn("定时发送线程异常退出。", ex);
             }
         }
 
@@ -1465,6 +1485,7 @@ namespace SerialPort
             {
                 lock (_saveLock) _saveFileWriter = null;
                 chkSaveFile.IsChecked = false;   // 创建失败则取消勾选，保持状态一致
+                LogService.Error($"创建保存文件失败：{filePath}", ex);
                 MessageBox.Show($"创建保存文件失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
                 return false;
             }
@@ -1594,9 +1615,10 @@ namespace SerialPort
                         {
                             _saveFileWriter.Write(text);
                         }
-                        catch
+                        catch (Exception ex)
                         {
                             // 写盘失败（磁盘满等）：放弃剩余数据、释放 writer，UI 复位保存勾选
+                            LogService.Error($"文件保存失败（写入 {_saveFilePath}）。", ex);
                             _saveQueue.Clear();
                             try { _saveFileWriter.Dispose(); } catch { }
                             _saveFileWriter = null;

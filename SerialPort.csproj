@@ -16,7 +16,7 @@
     <Deterministic>true</Deterministic>
     <ApplicationIcon>ICO\SerialPort.ico</ApplicationIcon>
     <!-- 单一版本源：每次发布新版本只改这里（x.y.z），构建时自动生成程序集版本号 -->
-    <Version>1.1.5</Version>
+    <Version>1.2.0</Version>
     <TargetFrameworkProfile />
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
@@ -143,6 +143,7 @@
     <Compile Include="Services\UpdateService.cs" />
     <Compile Include="Services\PortDeviceInfo.cs" />
     <Compile Include="Services\FrameParser.cs" />
+    <Compile Include="Services\LogService.cs" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="UI\ThemeManager.cs" />

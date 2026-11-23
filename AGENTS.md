@@ -62,6 +62,20 @@ Visual Studio 2026 安装在 `D:\Microsoft Visual Studio\18\Community`。构建�
 
 `UpdateService` 通过 GitHub Releases 检查新版本：网页端 `/releases/latest` 302 跳转解析 tag（不消耗 API 配额），确认有新版本才调 API 补全发布说明与附件地址；结果缓存 12 小时，`_checking` 用 `Interlocked` 管理并发；检查类请求 15 秒超时，下载类 10 分钟超时（HttpClient 默认 100 秒对大文件偏短）。`UpdateDialog` 确认后下载 → SHA256 校验（**校验文件缺失即拒绝更新**）→ 替换 exe → 启动新版本退出。下载任务接受 `CancellationToken`（`GetAsync` 也要传，否则响应头阶段无法取消）：**更新窗口关闭即取消**，替换程序前做最后一次取消检查。三个附件（exe 0-90% / sha256 90-95% / config 95-100%）共用一条进度条，按区间映射保证进度单调上升；下载响应无 `Content-Length` 时进度上报 -1（不确定进度）。更新工作目录按进程 ID 隔离（多实例互不干扰）；tag 支持预发布后缀，版本比较前补齐 4 段。取消与超时以 `token.IsCancellationRequested` 区分（`HttpClient` 超时抛的 `TaskCanceledException` 也派生自 `OperationCanceledException`）；`Process.Start` 失败单独提示"新版本已安装，但启动失败，请手动启动程序"，因为此时 exe 已被替换。检查区分手动/自动：手动检查失败才弹窗，启动时自动检查仅在状态栏提示。
 
+### 日志系统
+
+`Services/LogService.cs`（静态类）把程序运行事件与异常写入文本日志，是本项目**唯一的诊断出口**——状态栏只有一句中文提示且带 2 秒节流，无法据此定位问题，异常的类型、消息与堆栈必须靠日志留存。
+
+- **存放位置**：`AppDomain.CurrentDomain.BaseDirectory`（exe 同级）下的 `logs\` 目录；exe 所在目录不可写时（如装到 `Program Files`）退回 `%LOCALAPPDATA%\SerialPort\logs\`。
+- **文件命名**：启动时刻的"年月日时分秒"，格式 `yyyy-MM-dd_HH-mm-ss.txt`；**每次启动新建一个文件**，同一程序可同时存在多个会话日志。
+- **保留策略**：每次启动时删除 **7 天（一个星期）以前**的日志文件；只删文件名符合本程序格式且能解析出时间戳的文件，目录里其他文件不受影响。
+- **写入方式**：日志在独立后台线程（`LogWriter`，`IsBackground`）上写出，`Enqueue` 只入队即返回，**绝不阻塞调用方**——串口收发是高频路径，日志不能成为延迟源。文件用 UTF-8 带 BOM（记事本双击不乱码）+ `AutoFlush`（崩溃时也能留下现场）。
+- **异常处理**：日志自身的任何异常都被吞掉（写失败会尝试重开文件，仍失败则静默丢弃），**日志出问题绝不影响主程序**。
+- **级别**：`Debug` / `Info` / `Warn` / `Error`；带异常的条目额外输出类型、内部异常与堆栈。
+- **崩溃兜底**：`App.OnStartup` 订阅 `DispatcherUnhandledException` 与 `AppDomain.UnhandledException`，两者都调用 `LogService.Fatal`（**同步直写 + Flush**，不能走异步队列——进程随时被杀，排队日志会丢）；`App.OnExit` 调 `LogService.Shutdown()` 排空队列后关闭文件。
+- **初始化时机**：必须最先调用（`App.OnStartup` 开头），否则启动阶段发生的异常无处可记。
+- **接入原则**：新增后台线程 / 异步任务时，原本被静默吞掉的异常（`catch { }`）应改为 `catch (Exception ex)` 并写日志——**静默 catch 是排查问题的最大黑洞**。
+
 ## 端口命名冲突说明
 
 根命名空间 `SerialPort` 与 `System.IO.Ports.SerialPort` 冲突。在 `SerialPort.Services` 内部，C# 会将简单名称 `SerialPort` 解析为外层命名空间，因此框架类型在 `SerialPortService.cs` 顶部以别名 `SerialPortType` 引用。不要在本代码库中声明名为 `SerialPort` 的类，也不要在 `namespace SerialPort` 内部用简单名称引用框架类型。
