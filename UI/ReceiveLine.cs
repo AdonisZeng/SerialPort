@@ -174,8 +174,16 @@ namespace SerialPort.UI
     /// 支持整批 AddRange 与批量头部移除（FIFO 截头），每次操作只抛一个 CollectionChanged 事件，
     /// 避免逐行 Add 在高频接收时产生海量通知。全部操作仅在 UI 线程执行，无锁。
     /// TotalChars 维护行字符合计（含换行开销估算），供容量截头判断，避免全表扫描。
+    ///
+    /// 【关键约束】本类型**故意不实现非泛型 <see cref="IList"/>**。
+    /// WPF 的集合视图选择规则：源实现 IList → 用 <c>ListCollectionView</c>，
+    /// 其 ValidateCollectionChangedEventArgs 明确**拒绝范围（多元素）Add/Remove 通知**
+    /// （抛 NotSupportedException「不支持范围操作。」）；源只实现 IList&lt;T&gt; → 用
+    /// <c>EnumerableCollectionView</c>，它支持范围通知。
+    /// 本类的 AddRange / RemoveFromHead 发的正是范围通知，因此必须走后者，
+    /// 否则一收到多行批次或执行筛选重建（Clear + AddRange）就会抛异常导致程序崩溃。
     /// </summary>
-    internal sealed class ReceiveLineCollection : IList<ReceiveLine>, IList,
+    internal sealed class ReceiveLineCollection : IList<ReceiveLine>,
         INotifyCollectionChanged, INotifyPropertyChanged
     {
         private readonly List<ReceiveLine> _items = new List<ReceiveLine>();
@@ -351,70 +359,6 @@ namespace SerialPort.UI
         private void OnPropertyChanged(string name)
         {
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
-        }
-
-        // ---- 非泛型 IList 显式实现（ListBox 经 IList 访问项）----
-
-        object IList.this[int index]
-        {
-            get { return _items[index]; }
-            set { this[index] = (ReceiveLine)value; }
-        }
-
-        bool IList.IsFixedSize
-        {
-            get { return false; }
-        }
-
-        bool IList.IsReadOnly
-        {
-            get { return false; }
-        }
-
-        int IList.Add(object value)
-        {
-            Add((ReceiveLine)value);
-            return _items.Count - 1;
-        }
-
-        bool IList.Contains(object value)
-        {
-            return Contains(value as ReceiveLine);
-        }
-
-        int IList.IndexOf(object value)
-        {
-            return IndexOf(value as ReceiveLine);
-        }
-
-        void IList.Insert(int index, object value)
-        {
-            Insert(index, (ReceiveLine)value);
-        }
-
-        void IList.Remove(object value)
-        {
-            Remove(value as ReceiveLine);
-        }
-
-        void IList.Clear()
-        {
-            ClearItems();
-        }
-
-        void ICollection.CopyTo(Array array, int index)
-        {
-            ((ICollection)_items).CopyTo(array, index);
-        }
-
-        bool ICollection.IsSynchronized
-        {
-            get { return false; }
-        }
-
-        object ICollection.SyncRoot
-        {
-            get { return ((ICollection)_items).SyncRoot; }
         }
     }
 }

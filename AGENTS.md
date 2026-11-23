@@ -34,7 +34,22 @@ Visual Studio 2026 安装在 `D:\Microsoft Visual Studio\18\Community`。构建�
 
 - **`SerialPort.Services`** —— `SerialPortService`，一个 `sealed` 类，封装 `System.IO.Ports.SerialPort`（通过 `SerialPortType` 别名引用——根命名空间 `SerialPort` 遮蔽了框架类型），以及 `SerialPortConfig`、`DataBits` 枚举、`DataReceivedEventArgs`、`SerialPortItem` / `PortDeviceInfo`（WMI 端口描述查询）、`FrameParser`（通用协议帧解析：帧头 / 帧尾定界、CRC16-Modbus / Sum8 校验，**单帧收集上限 64 KB**，帧头定界模式用 `_partial` 维护一个"恒为帧头前缀"的**候选窗口**：新字节入队后只要 `IsHeaderPrefix()` 判定窗口不再是前缀，就把队首字节出队并计入帧体（帧尚未开始时丢弃），再对剩余窗口继续判定——既避免帧体中与帧头首字节相同的字节被吞掉，也能识别帧头自重叠时窗口中间的帧头（帧头 `AA AA 55`、帧体出现 `AA AA AA 55`）；窗口凑满 `_header.Length` 即完整帧头；帧尾定界模式的帧头匹配同样使用候选窗口回退（支持帧头自重叠）、提供 `Flush()` 输出残留末帧（仅帧头定界模式生效：帧尾定界模式的半帧按定义不成立，直接丢弃；串口断开时由主窗口调用））、`UpdateService`（自动更新）。`SerialPortService` 实现 `IDisposable`，构造时捕获 `SynchronizationContext.Current`（为空则回退 `DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher)`，避免事件落到线程池）。接收攒批设 **1 MB 硬上限**，溢出即丢弃并上报（避免高频数据下内存无限增长）。服务区分**逻辑连接**（`IsConnected`，由保存的 `_config` 决定，设备拔出等待重插期间仍为 true，UI 按钮以它为据）与**物理连接**（`IsOpen`，底层端口是否真正打开）；设备拔出时**不会自动断开**，UI 定时器检测到端口重现后调用 `TryReconnect()` 按原配置重建端口实例自动重连（无 `PortGone` 事件）。端口实例在每次打开 / 重连时重建（设备拔出后旧实例内部流已损坏，不可复用）。`_port` 字段跨线程访问（后台接收回调 vs UI 线程重建）由 `_portLock` 保护：**所有读写 `_port` 的方法都必须经 `TryGetOpenPort()` 在锁内取一次快照**，不得直接多次读 `_port`（否则 `DisposePort` 置 null 后第二次读会拿到 null 而抛 NRE）；真正的读写在锁外进行，避免持锁阻塞 `DisposePort`，端口若已被释放只会抛 `IOException` / `InvalidOperationException`，正好由 `HandleDeviceError` 兜住。RTS / DTR 引脚通过 `SetRts` / `SetDtr` 控制（仅物理打开时生效，重连后由 UI 的 `ApplyPinStates` 按勾选重写）。设备异常（拔出 / IO 错误 / 读写超时）经 `DeviceError` 事件上报 UI（**按时间全局节流**：2 秒内最多上报一次、**不区分错误文本**——只比对"上一条文本"会被交替出现的 `IOException`（写失败）与 `InvalidOperationException`（端口重建竞态）逐条绕过，节流形同虚设），只写状态栏不弹窗，不再完全静默。
 
-- **`SerialPort.UI`** —— `ThemeManager`（静态类）和 `ThemeMode` 枚举；`UI/ReceiveLine.cs`（接收区行模型 `ReceiveLine`、跨块行组装器 `ReceiveLineAssembler`、批量行集合 `ReceiveLineCollection`、行内匹配工具 `TextMatch`、查找结果 `FindResult`）；`UI/HighlightTextBlock.cs`（可继承附加属性 `SearchHighlight` 与按匹配分段着色的 `HighlightTextBlock`）。按 `Source` 定位 `Application.Current.Resources.MergedDictionaries` 中的主题字典并替换为 `Themes/LightTheme.xaml` 或 `Themes/DarkTheme.xaml`（找不到时才插入最前）来切换浅色 / 深色主题；所有主题颜色都通过 `DynamicResource` 引用，因此替换后会立即重新着色。强调色（`PortOpenBrush` / `PortCloseBrush` / `SendBtnBrush`）是 App.xaml 中的常量，不随主题变化。主题**持久化**到 `Settings.Theme`：切换时立即 `Save()`，`App.OnStartup` 在启动时恢复；由于 XAML 中主题按钮文案恒为"深色模式"，`MainWindow` 构造末尾必须调用 `UpdateThemeButtonText()` 校准（否则深色主题下重启按钮文案与当前主题不符）。`ReceiveLineCollection` 支持整批 `AddRange` / 头部批量 `RemoveFromHead`（各只抛一个 CollectionChanged 通知，WPF `ListCollectionView` 支持多元素 Add/Remove 事件），`TotalChars` 维护字符合计供容量截头判断；行集合与组装器均**仅 UI 线程**使用（数据经服务层 Post 编组后到达），无锁。
+- **`SerialPort.UI`** —— `ThemeManager`（静态类）和 `ThemeMode` 枚举；`UI/ReceiveLine.cs`（接收区行模型 `ReceiveLine`、跨块行组装器 `ReceiveLineAssembler`、批量行集合 `ReceiveLineCollection`、行内匹配工具 `TextMatch`、查找结果 `FindResult`）；`UI/HighlightTextBlock.cs`（可继承附加属性 `SearchHighlight` 与按匹配分段着色的 `HighlightTextBlock`）。按 `Source` 定位 `Application.Current.Resources.MergedDictionaries` 中的主题字典并替换为 `Themes/LightTheme.xaml` 或 `Themes/DarkTheme.xaml`（找不到时才插入最前）来切换浅色 / 深色主题；所有主题颜色都通过 `DynamicResource` 引用，因此替换后会立即重新着色。强调色（`PortOpenBrush` / `PortCloseBrush` / `SendBtnBrush`）是 App.xaml 中的常量，不随主题变化。主题**持久化**到 `Settings.Theme`：切换时立即 `Save()`，`App.OnStartup` 在启动时恢复；由于 XAML 中主题按钮文案恒为"深色模式"，`MainWindow` 构造末尾必须调用 `UpdateThemeButtonText()` 校准（否则深色主题下重启按钮文案与当前主题不符）。`ReceiveLineCollection` 支持整批 `AddRange` / 头部批量 `RemoveFromHead`（各只抛一个 CollectionChanged 通知），`TotalChars` 维护字符合计供容量截头判断；行集合与组装器均**仅 UI 线程**使用（数据经服务层 Post 编组后到达），无锁。**该集合故意不实现非泛型 `IList`**——这是硬性约束，详见下文「WPF 集合视图与范围通知」。
+
+### WPF 集合视图与范围通知（易踩的坑）
+
+WPF 的集合视图按源的类型二选一：
+
+| 源类型 | 选中的视图 | 是否支持范围（多元素）Add/Remove 通知 |
+| --- | --- | --- |
+| 同时实现 `IList<T>` **与非泛型 `IList`** | `ListCollectionView` | **不支持**——`ValidateCollectionChangedEventArgs` 直接抛 `NotSupportedException`「不支持范围操作。」 |
+| 只实现 `IList<T>`（非泛型 `IList`） | `EnumerableCollectionView`（内部类，公开 API 里没有） | 支持 |
+
+因此 `ReceiveLineCollection` **只实现 `IList<ReceiveLine>`**，不实现非泛型 `IList`：它的 `AddRange` / `RemoveFromHead` 发的正是范围通知，一旦源实现了非泛型 `IList`，WPF 就会改用 `ListCollectionView`，收到范围通知时抛异常——**一收到多行批次、或执行筛选重建（`ClearItems` + `AddRange`）就崩溃**（日志特征：`System.NotSupportedException`「不支持范围操作。」，堆栈含 `ListCollectionView.ValidateCollectionChangedEventArgs`）。
+
+代价：`IList` 视图对源做索引访问更快，本集合走 `EnumerableCollectionView` 的枚举路径；实测 5 万行范围 Add / 范围 Remove / 筛选重建均在数百毫秒内，虚拟化（5 万行仅实现十余个行容器）与 `ScrollIntoView` 均正常，**无需为性能退回逐行通知**。
+
+**教训**：给 WPF 的 `ItemsSource` 换实现时，先确认目标集合视图是否支持你要发的通知类型；范围通知（`AddRange` / `RemoveRange`）是这里性能与崩溃的取舍点。
 
 ### 关键模式：线程编组（thread marshaling）
 
