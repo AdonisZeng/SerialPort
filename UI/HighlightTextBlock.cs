@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
@@ -52,7 +53,7 @@ namespace SerialPort.UI
     {
         public static readonly DependencyProperty LineProperty = DependencyProperty.Register(
             "Line", typeof(ReceiveLine), typeof(HighlightTextBlock),
-            new PropertyMetadata(null, OnRebuild));
+            new PropertyMetadata(null, OnLineChanged));
 
         // 仅用于接收可继承搜索状态的内部依赖属性（绑定源 = 自身附加属性）
         private static readonly DependencyProperty TermProperty = DependencyProperty.Register(
@@ -68,6 +69,33 @@ namespace SerialPort.UI
         {
             get { return (ReceiveLine)GetValue(LineProperty); }
             set { SetValue(LineProperty, value); }
+        }
+
+        /// <summary>
+        /// 监听行文本变化：未完成行是**同一实例原位更新**（集合抛 Replace，容器不重建、
+        /// Line 依赖属性值不变），只有靠模型自身的 PropertyChanged 才能刷新显示。
+        /// 不监听的话行文本会永久停在容器创建那一刻的内容（现场"每行行尾丢字符"的根因）。
+        /// 用弱事件订阅：行被移出显示（筛选重建 / FIFO 截头）后容器可回收，
+        /// 而筛选缓冲仍持有那些行——强订阅会让行反过来把已废弃的容器一直吊住。
+        /// </summary>
+        private static void OnLineChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            var block = (HighlightTextBlock)d;
+            var oldLine = e.OldValue as INotifyPropertyChanged;
+            if (oldLine != null)
+                WeakEventManager<INotifyPropertyChanged, PropertyChangedEventArgs>.RemoveHandler(
+                    oldLine, nameof(INotifyPropertyChanged.PropertyChanged), block.OnLinePropertyChanged);
+            var newLine = e.NewValue as INotifyPropertyChanged;
+            if (newLine != null)
+                WeakEventManager<INotifyPropertyChanged, PropertyChangedEventArgs>.AddHandler(
+                    newLine, nameof(INotifyPropertyChanged.PropertyChanged), block.OnLinePropertyChanged);
+            block.Rebuild();
+        }
+
+        private void OnLinePropertyChanged(object sender, PropertyChangedEventArgs e)
+        {
+            if (string.IsNullOrEmpty(e.PropertyName) || e.PropertyName == nameof(ReceiveLine.Text))
+                Rebuild();
         }
 
         public HighlightTextBlock()

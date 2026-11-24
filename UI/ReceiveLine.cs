@@ -9,15 +9,33 @@ namespace SerialPort.UI
 {
     /// <summary>
     /// 接收区行模型：一行 = 一条最终显示文本（已含时间戳与 [RX]/[TX] 前缀，不含换行符）。
-    /// 文本可变：未完成行在数据续到时原位更新（集合抛 Replace 通知，虚拟化下只重建该行容器）。
+    /// 文本可变：未完成行在数据续到时原位更新。
+    ///
+    /// 【关键约束】原位更新**必须**经 <see cref="INotifyPropertyChanged"/> 通知显示层。
+    /// 集合的 Replace 通知带的是同一个实例，行容器的 Line 依赖属性值没变 → 不会重建；
+    /// 若只改 Text 不发通知，行文本会永久停在容器创建那一刻的内容（表现为"每行行尾丢字符"）。
     /// </summary>
-    internal sealed class ReceiveLine
+    internal sealed class ReceiveLine : INotifyPropertyChanged
     {
-        public string Text { get; internal set; }
+        private string _text;
+
+        public string Text
+        {
+            get { return _text; }
+            internal set
+            {
+                value = value ?? string.Empty;
+                if (string.Equals(_text, value, StringComparison.Ordinal)) return;
+                _text = value;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Text)));
+            }
+        }
+
+        public event PropertyChangedEventHandler PropertyChanged;
 
         public ReceiveLine(string text)
         {
-            Text = text ?? string.Empty;
+            _text = text ?? string.Empty;
         }
     }
 
